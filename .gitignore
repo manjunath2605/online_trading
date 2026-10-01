@@ -13,3 +13,11 @@ ai-engine/wheelhouse/
 # Misc build output
 build/
 dist/
+
+# Local runtime logs and secrets
+*.log
+.env
+.env.*
+backend/.env
+backend/*.log
+ai-engine/*.log
