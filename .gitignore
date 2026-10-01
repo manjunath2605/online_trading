@@ -1,0 +1,15 @@
+# Node / frontend / backend
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+frontend/build/
+
+# Python virtual environments and caches
+ai-engine/venv314fresh/
+ai-engine/wheelhouse/
+**/__pycache__/
+*.py[cod]
+
+# Misc build output
+build/
+dist/
