@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const API_BASE_URL = "https://online-trading-og8.onrender.com";
+const API_BASE_URL = "https://online-trading-backend.onrender.com";
 const CHART_INTERVAL_LABEL = "1s";
 const MIN_VISIBLE = 30;
 const DEFAULT_VISIBLE = 120;
