@@ -43,6 +43,67 @@ def signal_passes_filters(signal, filters):
     )
 
 
+def detect_candlestick_confirmation(frame, signal):
+    if frame is None or len(frame) < 2:
+        return None
+    if signal not in {"BUY CALL", "BUY PUT"}:
+        return None
+
+    previous = frame.iloc[-2]
+    current = frame.iloc[-1]
+    previous_open = to_number(previous["Open"])
+    previous_close = to_number(previous["Close"])
+    current_open = to_number(current["Open"])
+    current_close = to_number(current["Close"])
+    current_high = to_number(current["High"])
+    current_low = to_number(current["Low"])
+    body = abs(current_close - current_open)
+    candle_range = current_high - current_low
+
+    if body <= 0 or candle_range <= 0:
+        return None
+
+    upper_wick = current_high - max(current_open, current_close)
+    lower_wick = min(current_open, current_close) - current_low
+
+    if signal == "BUY CALL":
+        bullish_engulfing = (
+            previous_close < previous_open
+            and current_close > current_open
+            and current_open <= previous_close
+            and current_close >= previous_open
+        )
+        bullish_rejection = (
+            current_close > current_open
+            and lower_wick >= body * 2
+            and lower_wick / candle_range >= 0.55
+            and upper_wick <= body
+        )
+        if bullish_engulfing:
+            return "BULLISH_ENGULFING"
+        if bullish_rejection:
+            return "BULLISH_REJECTION"
+        return None
+
+    bearish_engulfing = (
+        previous_close > previous_open
+        and current_close < current_open
+        and current_open >= previous_close
+        and current_close <= previous_open
+    )
+    bearish_rejection = (
+        current_close < current_open
+        and upper_wick >= body * 2
+        and upper_wick / candle_range >= 0.55
+        and lower_wick <= body
+    )
+    if bearish_engulfing:
+        return "BEARISH_ENGULFING"
+    if bearish_rejection:
+        return "BEARISH_REJECTION"
+    return None
+
+
 def close_position(position, exit_price, exit_time, exit_reason, brokerage_per_side, slippage_per_side):
     direction = 1 if position["signal"] == "BUY CALL" else -1
     gross_pnl = round((exit_price - position["entry_price"]) * direction, 2)
@@ -61,6 +122,7 @@ def close_position(position, exit_price, exit_time, exit_reason, brokerage_per_s
         "risk_reward": round(position["risk_reward"], 2),
         "quality_score": round(position["quality_score"], 2),
         "confidence": round(position["confidence"], 2),
+        "candle_pattern": position.get("candle_pattern", "NONE"),
         "gross_pnl": gross_pnl,
         "costs": total_costs,
         "pnl": pnl,
@@ -82,28 +144,17 @@ def calculate_trade_risk(position):
     return risk
 
 
-def enforce_trade_rules(signal, price, support, resistance, volume_ratio, structure):
-    if structure == "RANGE":
-        return False
-    if volume_ratio < 1.0:
-        return False
-    if signal.get("signal") == "BUY CALL":
-        return price > resistance and signal.get("confidence", 0) >= 75
-    if signal.get("signal") == "BUY PUT":
-        return price < support and signal.get("confidence", 0) >= 75
-    return False
+def risk_fraction(signal, entry_price, stop_loss):
+    entry = to_number(entry_price, 0.0)
+    if entry <= 0:
+        return float("inf")
+
+    risk = (entry - stop_loss) if signal == "BUY CALL" else (stop_loss - entry)
+    return risk / entry if risk > 0 else float("inf")
 
 
-def enforce_trade_rules(signal, price, support, resistance, volume_ratio, structure):
-    if structure == "RANGE":
-        return False
-    if volume_ratio < 1.0:
-        return False
-    if signal.get("signal") == "BUY CALL":
-        return price > resistance and signal.get("confidence", 0) >= 75
-    if signal.get("signal") == "BUY PUT":
-        return price < support and signal.get("confidence", 0) >= 75
-    return False
+def daily_loss_limit_reached(daily_pnl, capital, max_daily_loss):
+    return daily_pnl <= -(capital * max_daily_loss)
 
 
 def run_backtest(
@@ -118,7 +169,8 @@ def run_backtest(
     brokerage_per_side=20.0,
     slippage_per_side=2.0,
     max_risk_per_trade=0.01,
-    max_daily_loss=0.05
+    max_daily_loss=0.05,
+    require_candle_confirmation=False
 ):
     df, name = get_data(symbol, period=period, interval=interval)
     if df is None or len(df) < 260:
@@ -128,106 +180,22 @@ def run_backtest(
         "min_confidence": min_confidence,
         "min_quality_score": min_quality_score,
         "min_risk_reward": min_risk_reward,
-        "min_volume_ratio": min_volume_ratio
+        "min_volume_ratio": min_volume_ratio,
+        "max_risk_per_trade": max_risk_per_trade,
+        "max_daily_loss": max_daily_loss
     }
-
-    capital = float(initial_capital)
-    equity_curve = [capital]
-    trades = []
-    position = None
-    warmup = 220
-
-    for index in range(warmup, len(df) - 1):
-        snapshot = df.iloc[: index + 1]
-        candle = df.iloc[index]
-        current_time = df.index[index]
-        next_candle = df.iloc[index + 1]
-        next_time = df.index[index + 1]
-
-        if position is not None:
-            exit_price = None
-            exit_reason = None
-
-            if position["signal"] == "BUY CALL":
-                if candle["Low"] <= position["stop_loss"]:
-                    exit_price = position["stop_loss"]
-                    exit_reason = "STOP_LOSS_HIT"
-                elif candle["High"] >= position["target"]:
-                    exit_price = position["target"]
-                    exit_reason = "TARGET_HIT"
-            else:
-                if candle["High"] >= position["stop_loss"]:
-                    exit_price = position["stop_loss"]
-                    exit_reason = "STOP_LOSS_HIT"
-                elif candle["Low"] <= position["target"]:
-                    exit_price = position["target"]
-                    exit_reason = "TARGET_HIT"
-
-            session_ended = current_time.date() != next_time.date()
-            if exit_price is None and session_ended:
-                exit_price = float(candle["Close"])
-                exit_reason = "DAY_END_EXIT"
-
-            if exit_price is not None:
-                trade = close_position(
-                    position,
-                    float(exit_price),
-                    current_time.isoformat(),
-                    exit_reason,
-                    brokerage_per_side,
-                    slippage_per_side
-                )
-                capital = round(capital + trade["pnl"], 2)
-                equity_curve.append(capital)
-                trades.append(trade)
-                position = None
-                continue
-
-        if position is not None:
-            continue
-
-        signal = compute_signal_payload(snapshot, name)
-        if not signal_passes_filters(signal, filters):
-            continue
-
-        position = {
-            "symbol": name,
-            "signal": signal["signal"],
-            "entry_time": next_time.isoformat(),
-            "entry_price": float(next_candle["Open"]),
-            "stop_loss": to_number(signal["stop_loss"]),
-            "target": to_number(signal["target"]),
-            "risk_reward": to_number(signal["risk_reward"]),
-            "quality_score": to_number(signal["quality_score"]),
-            "confidence": to_number(signal["confidence"])
-        }
-
-    if position is not None:
-        final_time = df.index[-1]
-        final_close = float(df["Close"].iloc[-1])
-        trade = close_position(
-            position,
-            final_close,
-            final_time.isoformat(),
-            "FORCED_EXIT",
-            brokerage_per_side,
-            slippage_per_side
-        )
-        capital = round(capital + trade["pnl"], 2)
-        equity_curve.append(capital)
-        trades.append(trade)
-
-    return summarize_results(
-        symbol=name,
-        period=period,
-        interval=interval,
-        initial_capital=initial_capital,
-        ending_capital=capital,
-        filters=filters,
-        trades=trades,
-        equity_curve=equity_curve,
-        brokerage_per_side=brokerage_per_side,
-        slippage_per_side=slippage_per_side
+    return run_backtest_on_frame(
+        df,
+        name,
+        period,
+        interval,
+        initial_capital,
+        filters,
+        brokerage_per_side,
+        slippage_per_side,
+        max_risk_per_trade=max_risk_per_trade,
+        max_daily_loss=max_daily_loss,
+        require_candle_confirmation=require_candle_confirmation
     )
 
 
@@ -242,6 +210,17 @@ def summarize_results(symbol, period, interval, initial_capital, ending_capital,
     average_loss = round(gross_loss / len(losses), 2) if losses else 0.0
     expectancy = round(total_pnl / len(trades), 2) if trades else 0.0
     profit_factor = round(gross_profit / gross_loss, 2) if gross_loss else None
+    candle_pattern_performance = {}
+    for pattern in sorted({trade.get("candle_pattern", "NONE") for trade in trades}):
+        pattern_trades = [trade for trade in trades if trade.get("candle_pattern", "NONE") == pattern]
+        pattern_wins = [trade for trade in pattern_trades if trade["pnl"] > 0]
+        pattern_net_pnl = round(sum(trade["pnl"] for trade in pattern_trades), 2)
+        candle_pattern_performance[pattern] = {
+            "trades": len(pattern_trades),
+            "win_rate": round((len(pattern_wins) / len(pattern_trades)) * 100, 2),
+            "net_pnl": pattern_net_pnl,
+            "expectancy_per_trade": round(pattern_net_pnl / len(pattern_trades), 2)
+        }
 
     peak = equity_curve[0] if equity_curve else initial_capital
     max_drawdown = 0.0
@@ -270,6 +249,7 @@ def summarize_results(symbol, period, interval, initial_capital, ending_capital,
         "expectancy_per_trade": expectancy,
         "profit_factor": profit_factor,
         "max_drawdown_percent": round(max_drawdown, 2),
+        "candle_pattern_performance": candle_pattern_performance,
         "brokerage_per_side": brokerage_per_side,
         "slippage_per_side": slippage_per_side,
         "trades": trades
@@ -343,7 +323,10 @@ def run_walk_forward(
     initial_capital=100000.0,
     train_days=3,
     brokerage_per_side=20.0,
-    slippage_per_side=2.0
+    slippage_per_side=2.0,
+    max_risk_per_trade=0.01,
+    max_daily_loss=0.05,
+    require_candle_confirmation=False
 ):
     df, name = get_data(symbol, period=period, interval=interval)
     if df is None or len(df) < 260:
@@ -378,7 +361,10 @@ def run_walk_forward(
                 initial_capital=100000.0,
                 filters=candidate,
                 brokerage_per_side=brokerage_per_side,
-                slippage_per_side=slippage_per_side
+                slippage_per_side=slippage_per_side,
+                max_risk_per_trade=max_risk_per_trade,
+                max_daily_loss=max_daily_loss,
+                require_candle_confirmation=require_candle_confirmation
             )
             if validation_df is not None and not validation_df.empty:
                 validation_result = run_backtest_on_frame(
@@ -389,7 +375,10 @@ def run_walk_forward(
                     initial_capital=100000.0,
                     filters=candidate,
                     brokerage_per_side=brokerage_per_side,
-                    slippage_per_side=slippage_per_side
+                    slippage_per_side=slippage_per_side,
+                    max_risk_per_trade=max_risk_per_trade,
+                    max_daily_loss=max_daily_loss,
+                    require_candle_confirmation=require_candle_confirmation
                 )
             else:
                 validation_result = train_result
@@ -421,7 +410,10 @@ def run_walk_forward(
             initial_capital=capital,
             filters=best_filters,
             brokerage_per_side=brokerage_per_side,
-            slippage_per_side=slippage_per_side
+            slippage_per_side=slippage_per_side,
+            max_risk_per_trade=max_risk_per_trade,
+            max_daily_loss=max_daily_loss,
+            require_candle_confirmation=require_candle_confirmation
         )
 
         capital = round(capital + test_result["net_pnl"], 2)
@@ -472,7 +464,19 @@ def run_walk_forward(
     return summary
 
 
-def run_backtest_on_frame(frame, name, period, interval, initial_capital, filters, brokerage_per_side, slippage_per_side):
+def run_backtest_on_frame(
+    frame,
+    name,
+    period,
+    interval,
+    initial_capital,
+    filters,
+    brokerage_per_side,
+    slippage_per_side,
+    max_risk_per_trade=0.01,
+    max_daily_loss=0.05,
+    require_candle_confirmation=False
+):
     if frame is None or len(frame) < 260:
         return summarize_results(
             symbol=name,
@@ -492,6 +496,8 @@ def run_backtest_on_frame(frame, name, period, interval, initial_capital, filter
     equity_curve = [capital]
     position = None
     warmup = 220
+    current_session = None
+    daily_pnl = 0.0
 
     for index in range(warmup, len(frame) - 1):
         snapshot = frame.iloc[: index + 1]
@@ -499,6 +505,10 @@ def run_backtest_on_frame(frame, name, period, interval, initial_capital, filter
         current_time = frame.index[index]
         next_candle = frame.iloc[index + 1]
         next_time = frame.index[index + 1]
+
+        if current_session != current_time.date():
+            current_session = current_time.date()
+            daily_pnl = 0.0
 
         if position is not None:
             exit_price = None
@@ -534,6 +544,7 @@ def run_backtest_on_frame(frame, name, period, interval, initial_capital, filter
                     slippage_per_side
                 )
                 capital = round(capital + trade["pnl"], 2)
+                daily_pnl = round(daily_pnl + trade["pnl"], 2)
                 equity_curve.append(capital)
                 trades.append(trade)
                 position = None
@@ -542,22 +553,20 @@ def run_backtest_on_frame(frame, name, period, interval, initial_capital, filter
         if position is not None:
             continue
 
+        if daily_loss_limit_reached(daily_pnl, initial_capital, max_daily_loss):
+            continue
+
         signal = compute_signal_payload(snapshot, name)
         if not signal_passes_filters(signal, filters):
             continue
 
-        support = to_number(signal.get("support"), 0.0)
-        resistance = to_number(signal.get("resistance"), 0.0)
         current_price = float(candle["Close"])
-        volume_ratio = to_number(signal.get("volume_ratio"), 0.0)
-        structure = str(signal.get("market_regime") or "").upper()
-        if not enforce_trade_rules(signal, current_price, support, resistance, volume_ratio, structure):
+        candle_pattern = detect_candlestick_confirmation(snapshot, signal["signal"])
+        if require_candle_confirmation and candle_pattern is None:
             continue
 
-        risk = abs(current_price - to_number(signal["stop_loss"], current_price))
-        if risk <= 0:
-            continue
-        if 0 < 0.01 and risk / current_price > 0.01:
+        stop_loss = to_number(signal["stop_loss"], current_price)
+        if risk_fraction(signal["signal"], current_price, stop_loss) > max_risk_per_trade:
             continue
 
         position = {
@@ -565,12 +574,12 @@ def run_backtest_on_frame(frame, name, period, interval, initial_capital, filter
             "signal": signal["signal"],
             "entry_time": next_time.isoformat(),
             "entry_price": float(next_candle["Open"]),
-            "stop_loss": to_number(signal["stop_loss"]),
+            "stop_loss": stop_loss,
             "target": to_number(signal["target"]),
             "risk_reward": to_number(signal["risk_reward"]),
             "quality_score": to_number(signal["quality_score"]),
             "confidence": to_number(signal["confidence"]),
-            "risk": risk
+            "candle_pattern": candle_pattern or "NONE"
         }
 
     if position is not None:
@@ -613,6 +622,7 @@ def print_pretty(result, mode):
     print(f"Expectancy / Trade: {result['expectancy_per_trade']}")
     print(f"Profit Factor: {result['profit_factor']}")
     print(f"Max Drawdown: {result['max_drawdown_percent']}%")
+    print(f"Candlestick Outcomes: {result['candle_pattern_performance']}")
     print(f"Filters: {result['filters']}")
     if mode == "Walk Forward":
         print(f"Windows: {len(result.get('windows', []))}")
@@ -630,6 +640,9 @@ def main():
     parser.add_argument("--min-quality", type=float, default=55)
     parser.add_argument("--min-rr", type=float, default=1.4)
     parser.add_argument("--min-volume", type=float, default=1.1)
+    parser.add_argument("--max-risk-per-trade", type=float, default=0.01)
+    parser.add_argument("--max-daily-loss", type=float, default=0.05)
+    parser.add_argument("--require-candle-confirmation", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--train-days", type=int, default=3)
     parser.add_argument("--output", choices=["json", "pretty"], default="pretty")
@@ -643,7 +656,10 @@ def main():
             initial_capital=args.capital,
             train_days=args.train_days,
             brokerage_per_side=args.brokerage,
-            slippage_per_side=args.slippage
+            slippage_per_side=args.slippage,
+            max_risk_per_trade=args.max_risk_per_trade,
+            max_daily_loss=args.max_daily_loss,
+            require_candle_confirmation=args.require_candle_confirmation
         )
         mode = "Walk Forward"
     else:
@@ -657,7 +673,10 @@ def main():
             min_risk_reward=args.min_rr,
             min_volume_ratio=args.min_volume,
             brokerage_per_side=args.brokerage,
-            slippage_per_side=args.slippage
+            slippage_per_side=args.slippage,
+            max_risk_per_trade=args.max_risk_per_trade,
+            max_daily_loss=args.max_daily_loss,
+            require_candle_confirmation=args.require_candle_confirmation
         )
         mode = "Backtest"
 
