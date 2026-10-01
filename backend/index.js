@@ -34,7 +34,18 @@ const {
 } = require("./utils/performanceAnalytics");
 
 const app = express();
-app.use(cors());
+const allowedOrigins = (process.env.CORS_ORIGIN || "https://online-trading-rho.vercel.app").split(",").map((value) => value.trim()).filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error("CORS blocked"));
+  },
+  credentials: true
+}));
 app.use(express.json());
 
 let lastSignals = {};
