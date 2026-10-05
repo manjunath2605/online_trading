@@ -89,7 +89,7 @@ const MIN_VOLUME_RATIO = Math.max(Number(process.env.MIN_VOLUME_RATIO || 0), 1.0
 const REQUIRE_HIGHER_TF_CONFIRMATION = process.env.REQUIRE_HIGHER_TF_CONFIRMATION !== "false";
 const BLOCK_RANGE_REGIME = process.env.BLOCK_RANGE_REGIME !== "false";
 const REQUIRE_LIQUIDITY_CONFIRMATION = process.env.REQUIRE_LIQUIDITY_CONFIRMATION !== "false";
-const AI_ENGINE_TIMEOUT_MS = Number(process.env.AI_ENGINE_TIMEOUT_MS || 8000);
+const AI_ENGINE_TIMEOUT_MS = Number(process.env.AI_ENGINE_TIMEOUT_MS || 30000);
 const MAX_SIGNAL_SPOT_DRIFT_PCT = Math.max(Number(process.env.MAX_SIGNAL_SPOT_DRIFT_PCT || 0.35), 0);
 const MAX_LIVE_PRICE_STALENESS_MS = Math.max(Number(process.env.MAX_LIVE_PRICE_STALENESS_MS || 15000), 1000);
 const PERFORMANCE_LOOKBACK_TRADES = Math.max(Number(process.env.PERFORMANCE_LOOKBACK_TRADES || 8), 3);

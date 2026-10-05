@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 
 from flask import Flask, jsonify, request
 import pandas as pd
@@ -8,6 +10,9 @@ from marketStructure import detect_market_structure
 from liquidityEngine import detect_liquidity_sweep
 
 app = Flask(__name__)
+MARKET_DATA_CACHE_TTL_SECONDS = max(int(os.environ.get("MARKET_DATA_CACHE_TTL_SECONDS", 15)), 0)
+market_data_cache = {}
+market_data_cache_lock = threading.Lock()
 
 SYMBOL_CONFIGS = {
     "nifty": {
@@ -174,6 +179,14 @@ def load_market_data(symbol, period="5d", interval="1m"):
     if not config:
         return None, None
 
+    cache_key = (normalize_symbol(symbol), period, interval)
+    now = time.monotonic()
+    with market_data_cache_lock:
+        cached = market_data_cache.get(cache_key)
+        if cached and now - cached[0] < MARKET_DATA_CACHE_TTL_SECONDS:
+            return cached[1].copy(), cached[2]
+
+    started_at = time.monotonic()
     df = yf.download(
         config["ticker"],
         period=period,
@@ -181,8 +194,15 @@ def load_market_data(symbol, period="5d", interval="1m"):
         auto_adjust=False,
         progress=False
     )
+    elapsed_seconds = time.monotonic() - started_at
+    app.logger.info("Yahoo market data fetch for %s took %.2f seconds", config["name"], elapsed_seconds)
 
-    return normalize_market_data(df), config["name"]
+    normalized = normalize_market_data(df)
+    if normalized is not None and MARKET_DATA_CACHE_TTL_SECONDS > 0:
+        with market_data_cache_lock:
+            market_data_cache[cache_key] = (time.monotonic(), normalized.copy(), config["name"])
+
+    return normalized, config["name"]
 
 
 def compute_signal_payload(df, symbol_name):
