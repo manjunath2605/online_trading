@@ -1704,27 +1704,8 @@ app.get("/signal", async (req, res) => {
   }
 });
 
-app.get("/signals/latest", async (req, res) => {
-  try {
-    if (latestSignalResults.length === 0 || req.query.refresh === "true") {
-      const { data } = await axios.get(`http://localhost:${PORT}/signal`, {
-        timeout: AI_ENGINE_TIMEOUT_MS + 2000,
-        validateStatus: () => true
-      });
-      latestSignalResults = Array.isArray(data) ? data : data?.results || [];
-    }
-
-    return res.json(latestSignalResults);
-  } catch (error) {
-    console.error("Latest signal fetch error:", formatError(error));
-    if (latestSignalResults.length > 0) {
-      return res.json(latestSignalResults);
-    }
-    return res.status(500).json({
-      error: "Latest signal fetch failed",
-      details: formatError(error)
-    });
-  }
+app.get("/signals/latest", (req, res) => {
+  return res.json(latestSignalResults);
 });
 
 app.get("/trades", async (req, res) => {
