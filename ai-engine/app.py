@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, jsonify, request
 import pandas as pd
 import yfinance as yf
@@ -675,4 +677,4 @@ def walk_forward_route(symbol):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

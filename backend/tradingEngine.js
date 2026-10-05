@@ -28,7 +28,18 @@ const LIVE_CANDLE_INTERVAL_SECONDS = Number(process.env.ANGEL_LIVE_CANDLE_INTERV
 const HISTORY_BACKFILL_CANDLES = Number(process.env.ANGEL_HISTORY_BACKFILL_CANDLES || 180);
 const MIN_HISTORY_READY_CANDLES = Number(process.env.ANGEL_MIN_HISTORY_READY_CANDLES || 120);
 const HISTORY_BACKFILL_RETRY_MS = Number(process.env.ANGEL_HISTORY_BACKFILL_RETRY_MS || 30000);
-const AI_ENGINE_URL = (process.env.AI_ENGINE_URL || "http://127.0.0.1:5000").replace(/\/$/, "");
+const resolveAiEngineUrl = () => {
+  const configuredUrl = process.env.AI_ENGINE_URL || process.env.AI_ENGINE_HOST || process.env.AI_ENGINE_BASE_URL;
+  const value = (configuredUrl || "http://127.0.0.1:5000").replace(/\/$/, "");
+
+  if (!configuredUrl) {
+    console.warn("AI_ENGINE_URL is not set. Falling back to http://127.0.0.1:5000. In production, set AI_ENGINE_URL to the live AI-engine host.");
+  }
+
+  return value;
+};
+
+const AI_ENGINE_URL = resolveAiEngineUrl();
 const LOTS_PER_TRADE = Number(process.env.ANGEL_LOTS_PER_TRADE || 1);
 const OPTION_QUOTE_CACHE_TTL_MS = Math.max(Number(process.env.ANGEL_OPTION_QUOTE_CACHE_TTL_MS || 5000), 1000);
 const MARKET_POLL_BACKOFF_MS = Math.max(Number(process.env.ANGEL_MARKET_POLL_BACKOFF_MS || 15000), LIVE_POLL_INTERVAL_MS);

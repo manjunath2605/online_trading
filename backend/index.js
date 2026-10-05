@@ -34,17 +34,34 @@ const {
 } = require("./utils/performanceAnalytics");
 
 const app = express();
-const allowedOrigins = (process.env.CORS_ORIGIN || "https://online-trading-rho.vercel.app").split(",").map((value) => value.trim()).filter(Boolean);
+const defaultAllowedOrigins = [
+  "https://online-trading-rho.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:3001",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:3001",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173"
+];
+const allowedOrigins = (process.env.CORS_ORIGIN || defaultAllowedOrigins.join(",")).split(",").map((value) => value.trim()).filter(Boolean);
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes(origin.replace(/\/+$/, ""))) {
+      callback(null, true);
+      return;
+    }
+    const normalizedOrigin = origin.replace(/\/+$/, "");
+    const isLocalDevOrigin = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?$/.test(normalizedOrigin);
+    if (isLocalDevOrigin) {
       callback(null, true);
       return;
     }
     callback(new Error("CORS blocked"));
   },
-  credentials: true
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"]
 }));
 app.use(express.json());
 
@@ -80,7 +97,18 @@ const PERFORMANCE_GUARD_MIN_WIN_RATE = Math.max(Number(process.env.PERFORMANCE_G
 const PERFORMANCE_GUARD_MAX_LOSSES = Math.max(Number(process.env.PERFORMANCE_GUARD_MAX_LOSSES || 5), 1);
 const PERFORMANCE_GUARD_MAX_NET_LOSS = Number(process.env.PERFORMANCE_GUARD_MAX_NET_LOSS || -2500);
 
-const AI_ENGINE_URL = (process.env.AI_ENGINE_URL || "http://127.0.0.1:5000").replace(/\/$/, "");
+const resolveAiEngineUrl = () => {
+  const configuredUrl = process.env.AI_ENGINE_URL || process.env.AI_ENGINE_HOST || process.env.AI_ENGINE_BASE_URL;
+  const value = (configuredUrl || "http://127.0.0.1:5000").replace(/\/$/, "");
+
+  if (!configuredUrl) {
+    console.warn("AI_ENGINE_URL is not set. Falling back to http://127.0.0.1:5000. In production, set AI_ENGINE_URL to the live AI-engine host.");
+  }
+
+  return value;
+};
+
+const AI_ENGINE_URL = resolveAiEngineUrl();
 const SIGNAL_SLOTS = [
   { key: "nifty", symbol: "nifty" },
   { key: "banknifty", symbol: "banknifty" }
