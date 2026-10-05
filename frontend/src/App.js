@@ -1097,7 +1097,7 @@ function App() {
   const loadData = () => {
     fetchJson(`${API_BASE_URL}/trades`).then(setTrades).catch(() => {});
     fetchJson(`${API_BASE_URL}/stats`).then(setStats).catch(() => {});
-    fetchJson(`${API_BASE_URL}/signals/latest?refresh=true`)
+    fetchJson(`${API_BASE_URL}/signals/latest`)
       .then((payload) => setSignals(Array.isArray(payload) ? payload : []))
       .catch(() => {
         fetchJson(`${API_BASE_URL}/signal`)
