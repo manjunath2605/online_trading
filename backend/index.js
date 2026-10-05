@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
 const axios = require("axios");
@@ -495,6 +495,14 @@ const connectDatabase = async () => {
 };
 
 const isMongoConnected = () => mongoose.connection.readyState === 1;
+
+app.get("/health", (req, res) => {
+  const databaseConnected = isMongoConnected();
+  return res.status(databaseConnected ? 200 : 503).json({
+    status: databaseConnected ? "ok" : "degraded",
+    database: databaseConnected ? "connected" : "disconnected"
+  });
+});
 
 const fetchSignalAnalysis = async (symbol) => {
   const { data } = await axios.get(`${AI_ENGINE_URL}/analyze/${symbol}`, {
