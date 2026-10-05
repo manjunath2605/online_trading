@@ -496,12 +496,45 @@ const connectDatabase = async () => {
   console.log("MongoDB connected");
 };
 
+const connectDatabaseWithRetry = async () => {
+  let retryDelayMs = 5000;
+
+  while (!isMongoConnected()) {
+    try {
+      await connectDatabase();
+      return;
+    } catch (error) {
+      console.error(`MongoDB connection failed; retrying in ${retryDelayMs}ms:`, formatError(error));
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      retryDelayMs = Math.min(retryDelayMs * 2, 60000);
+    }
+  }
+};
+
 const isMongoConnected = () => mongoose.connection.readyState === 1;
+const requireMongoConnection = (req, res, next) => {
+  if (!isMongoConnected()) {
+    return res.status(503).json({
+      error: "Database unavailable",
+      status: "degraded"
+    });
+  }
+
+  return next();
+};
 
 app.get("/health", (req, res) => {
   const databaseConnected = isMongoConnected();
-  return res.status(databaseConnected ? 200 : 503).json({
+  return res.json({
     status: databaseConnected ? "ok" : "degraded",
+    database: databaseConnected ? "connected" : "disconnected"
+  });
+});
+
+app.get("/ready", (req, res) => {
+  const databaseConnected = isMongoConnected();
+  return res.status(databaseConnected ? 200 : 503).json({
+    status: databaseConnected ? "ready" : "not_ready",
     database: databaseConnected ? "connected" : "disconnected"
   });
 });
@@ -1434,7 +1467,7 @@ startLiveMarketFeed().catch((error) => {
   console.error("Live market feed failed to start:", formatError(error));
 });
 
-app.get("/signal", async (req, res) => {
+app.get("/signal", requireMongoConnection, async (req, res) => {
   try {
     const results = [];
     let aiEngineUnavailable = false;
@@ -1717,6 +1750,8 @@ app.get("/signal", async (req, res) => {
 app.get("/signals/latest", (req, res) => {
   return res.json(latestSignalResults);
 });
+
+app.use(["/trades", "/stats", "/signals"], requireMongoConnection);
 
 app.get("/trades", async (req, res) => {
   const trades = await getTrackedTrades();
@@ -2121,11 +2156,7 @@ cron.schedule("0 0 * * *", () => {
   timezone: MARKET_TIMEZONE
 });
 
-connectDatabase()
-  .then(() => {
-    app.listen(PORT, () => console.log(`Backend running on ${PORT}`));
-  })
-  .catch((error) => {
-    console.error("MongoDB connection failed:", formatError(error));
-    process.exit(1);
-  });
+app.listen(PORT, () => console.log(`Backend running on ${PORT}`));
+connectDatabaseWithRetry().catch((error) => {
+  console.error("MongoDB reconnect loop failed unexpectedly:", formatError(error));
+});

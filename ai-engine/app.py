@@ -515,13 +515,14 @@ def compute_signal_payload(df, symbol_name):
         signal = "HOLD"
         trade = "WAIT"
         signal_reasons = ["No clean trend confirmation or breakout confirmation"]
-        failed_checks.append("directional_edge_missing")
         if structure == "RANGE":
             failed_checks.append("range_structure")
         if volume_ratio < 1.0:
             failed_checks.append("volume_support_missing")
         if not strong_directional_edge:
             failed_checks.append("directional_edge_too_small")
+        if max(buy_score, sell_score) < 7.0:
+            failed_checks.append("directional_score_below_threshold")
         if not (strict_bullish or strict_bearish or trend_long_confirmed or breakout_long_confirmed or trend_short_confirmed or breakout_short_confirmed):
             failed_checks.append("trend_or_breakout_missing")
 
