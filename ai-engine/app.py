@@ -10,7 +10,7 @@ from marketStructure import detect_market_structure
 from liquidityEngine import detect_liquidity_sweep
 
 app = Flask(__name__)
-MARKET_DATA_CACHE_TTL_SECONDS = max(int(os.environ.get("MARKET_DATA_CACHE_TTL_SECONDS", 15)), 0)
+MARKET_DATA_CACHE_TTL_SECONDS = max(int(os.environ.get("MARKET_DATA_CACHE_TTL_SECONDS", 60)), 0)
 market_data_cache = {}
 market_data_cache_lock = threading.Lock()
 

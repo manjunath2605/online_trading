@@ -831,11 +831,7 @@ function App() {
     fetchJson(`${API_BASE_URL}/stats`).then(setStats).catch(() => {});
     fetchJson(`${API_BASE_URL}/signals/latest`)
       .then((payload) => setSignals(Array.isArray(payload) ? payload : []))
-      .catch(() => {
-        fetchJson(`${API_BASE_URL}/signal`)
-          .then((payload) => setSignals(Array.isArray(payload) ? payload : payload?.results || []))
-          .catch(() => {});
-      });
+      .catch(() => {});
     fetchJson(`${API_BASE_URL}/market/feed-status`).then(setFeedStatus).catch(() => {});
     fetchJson(`${API_BASE_URL}/market/status`).then(setMarketStatus).catch(() => {});
   };
