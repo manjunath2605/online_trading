@@ -13,6 +13,7 @@ app = Flask(__name__)
 MARKET_DATA_CACHE_TTL_SECONDS = max(int(os.environ.get("MARKET_DATA_CACHE_TTL_SECONDS", 60)), 0)
 market_data_cache = {}
 market_data_cache_lock = threading.Lock()
+market_data_fetch_lock = threading.Lock()
 
 SYMBOL_CONFIGS = {
     "nifty": {
@@ -180,29 +181,37 @@ def load_market_data(symbol, period="5d", interval="1m"):
         return None, None
 
     cache_key = (normalize_symbol(symbol), period, interval)
-    now = time.monotonic()
-    with market_data_cache_lock:
-        cached = market_data_cache.get(cache_key)
-        if cached and now - cached[0] < MARKET_DATA_CACHE_TTL_SECONDS:
-            return cached[1].copy(), cached[2]
-
-    started_at = time.monotonic()
-    df = yf.download(
-        config["ticker"],
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False
-    )
-    elapsed_seconds = time.monotonic() - started_at
-    app.logger.info("Yahoo market data fetch for %s took %.2f seconds", config["name"], elapsed_seconds)
-
-    normalized = normalize_market_data(df)
-    if normalized is not None and MARKET_DATA_CACHE_TTL_SECONDS > 0:
+    with market_data_fetch_lock:
+        now = time.monotonic()
         with market_data_cache_lock:
-            market_data_cache[cache_key] = (time.monotonic(), normalized.copy(), config["name"])
+            cached = market_data_cache.get(cache_key)
+            if cached and now - cached[0] < MARKET_DATA_CACHE_TTL_SECONDS:
+                cached_frame = cached[1]
+                return cached_frame.copy() if cached_frame is not None else None, cached[2]
 
-    return normalized, config["name"]
+        started_at = time.monotonic()
+        try:
+            df = yf.download(
+                config["ticker"],
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False
+            )
+            normalized = normalize_market_data(df)
+        except Exception as error:
+            normalized = None
+            app.logger.warning("Yahoo market data fetch failed for %s: %s", config["name"], error)
+
+        elapsed_seconds = time.monotonic() - started_at
+        app.logger.info("Yahoo market data fetch for %s took %.2f seconds", config["name"], elapsed_seconds)
+
+        if MARKET_DATA_CACHE_TTL_SECONDS > 0:
+            cached_frame = normalized.copy() if normalized is not None else None
+            with market_data_cache_lock:
+                market_data_cache[cache_key] = (time.monotonic(), cached_frame, config["name"])
+
+        return normalized, config["name"]
 
 
 def compute_signal_payload(df, symbol_name):

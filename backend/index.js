@@ -43,7 +43,8 @@ const defaultAllowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173"
 ];
-const allowedOrigins = (process.env.CORS_ORIGIN || defaultAllowedOrigins.join(",")).split(",").map((value) => value.trim()).filter(Boolean);
+const configuredAllowedOrigins = (process.env.CORS_ORIGIN || "").split(",").map((value) => value.trim()).filter(Boolean);
+const allowedOrigins = [...new Set([...defaultAllowedOrigins, ...configuredAllowedOrigins])];
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -57,6 +58,7 @@ app.use(cors({
       callback(null, true);
       return;
     }
+    console.warn(`CORS blocked request from origin: ${origin}`);
     callback(new Error("CORS blocked"));
   },
   credentials: true,
