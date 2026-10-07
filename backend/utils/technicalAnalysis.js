@@ -210,7 +210,7 @@ function analyzeCandles(symbol, candles, currentLivePrice) {
 
   // Option estimates (sensible 18% stop loss and 25% target)
   const lotSize = isBankNifty ? 30 : 65;
-  const estimatedOptionPrice = Number(Math.max(30, atr * (isBankNifty ? 2.2 : 2.5)).toFixed(2));
+  const estimatedOptionPrice = Number(Math.max(isBankNifty ? 320 : 110, atr * (isBankNifty ? 6.5 : 14.0)).toFixed(2));
   const optionStopLoss = signal !== "HOLD" ? Number((estimatedOptionPrice * 0.82).toFixed(2)) : null;
   const optionTargetPrice = signal !== "HOLD" ? Number((estimatedOptionPrice * 1.25).toFixed(2)) : null;
   const optionTargetPrice2 = signal !== "HOLD" ? Number((estimatedOptionPrice * 1.45).toFixed(2)) : null;
@@ -274,3 +274,4 @@ module.exports = {
   calculateVWAP,
   roundStrike
 };
+

@@ -397,20 +397,19 @@ def compute_signal_payload(df, symbol_name):
 
     strict_long_stop = max(support * 0.9975, support - atr_val * 0.35)
     strict_short_stop = min(resistance * 1.0025, resistance + atr_val * 0.35)
-    strict_long_target = max(price + atr_val * 2.2, resistance + atr_val * 1.4)
-    strict_short_target = min(price - atr_val * 2.2, support - atr_val * 1.4)
-    if strict_long_target <= price:
-        strict_long_target = price + atr_val * 1.8
-    if strict_short_target >= price:
-        strict_short_target = price - atr_val * 1.8
+
+    long_risk = max(price - strict_long_stop, atr_val * 0.6)
+    short_risk = max(strict_short_stop - price, atr_val * 0.6)
+
+    # Ensure Target provides at least 2.0x the risk for positive expectancy
+    strict_long_target = max(price + (long_risk * 2.0), resistance + atr_val * 1.5)
+    strict_short_target = min(price - (short_risk * 2.0), support - atr_val * 1.5)
 
     long_stop = strict_long_stop
     short_stop = strict_short_stop
     long_target = strict_long_target
     short_target = strict_short_target
 
-    long_risk = max(price - long_stop, atr_val * 0.6)
-    short_risk = max(short_stop - price, atr_val * 0.6)
     long_reward = max(long_target - price, 0)
     short_reward = max(price - short_target, 0)
     long_rr = round(long_reward / long_risk, 2) if long_risk > 0 else 0
@@ -496,8 +495,8 @@ def compute_signal_payload(df, symbol_name):
     strong_directional_edge = abs(buy_score - sell_score) >= 1.5
 
     range_filter = structure == "RANGE" or (volume_available and volume_ratio < 0.8)
-    long_entry_allowed = (strict_bullish or trend_long_confirmed or breakout_long_confirmed or (buy_score >= 6.0 and higher_tf_bullish and price > ema20)) and not range_filter and strong_directional_edge and buy_score >= 5.5
-    short_entry_allowed = (strict_bearish or trend_short_confirmed or breakout_short_confirmed or (sell_score >= 6.0 and higher_tf_bearish and price < ema20)) and not range_filter and strong_directional_edge and sell_score >= 5.5
+    long_entry_allowed = (strict_bullish or trend_long_confirmed or breakout_long_confirmed or (buy_score >= 6.0 and higher_tf_bullish and price > ema20)) and not range_filter and strong_directional_edge and buy_score >= 5.5 and long_rr >= 1.5
+    short_entry_allowed = (strict_bearish or trend_short_confirmed or breakout_short_confirmed or (sell_score >= 6.0 and higher_tf_bearish and price < ema20)) and not range_filter and strong_directional_edge and sell_score >= 5.5 and short_rr >= 1.5
 
     if long_entry_allowed:
         signal = "BUY CALL"
@@ -597,10 +596,10 @@ def compute_signal_payload(df, symbol_name):
         "volume_available": bool(volume_available),
         "higher_tf_bullish": bool(higher_tf_bullish),
         "higher_tf_bearish": bool(higher_tf_bearish),
-        "estimated_option_price": round(max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)), 2),
-        "option_stop_loss": round(max(20.0, max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)) * 0.82), 2) if signal != "HOLD" else None,
-        "option_target_price": round(max(30.0, max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)) * 1.25), 2) if signal != "HOLD" else None,
-        "option_target_price_2": round(max(35.0, max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)) * 1.45), 2) if signal != "HOLD" else None,
+        "estimated_option_price": round(max(110.0 if "NIFTY" in symbol_name and "BANK" not in symbol_name else 320.0, atr_val * (6.5 if "BANK" in symbol_name else 14.0)), 2),
+        "option_stop_loss": round(max(110.0 if "NIFTY" in symbol_name and "BANK" not in symbol_name else 320.0, atr_val * (6.5 if "BANK" in symbol_name else 14.0)) * 0.82, 2) if signal != "HOLD" else None,
+        "option_target_price": round(max(110.0 if "NIFTY" in symbol_name and "BANK" not in symbol_name else 320.0, atr_val * (6.5 if "BANK" in symbol_name else 14.0)) * 1.25, 2) if signal != "HOLD" else None,
+        "option_target_price_2": round(max(110.0 if "NIFTY" in symbol_name and "BANK" not in symbol_name else 320.0, atr_val * (6.5 if "BANK" in symbol_name else 14.0)) * 1.45, 2) if signal != "HOLD" else None,
         "score_breakdown": {
             "bullish_quality_bonus": round(bullish_quality_bonus, 2),
             "bearish_quality_bonus": round(bearish_quality_bonus, 2),

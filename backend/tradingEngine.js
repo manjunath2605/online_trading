@@ -1156,6 +1156,34 @@ const subscribeLiveTicks = async () => {
   startMarketDataPolling();
 };
 
+const updateLiveMarketSpotPrice = (symbol, price, source = "feed") => {
+  const config = getLiveInstrumentConfig(symbol);
+  if (!config) {
+    return;
+  }
+  const stateKey = config.stateKey;
+  const state = liveMarketState[stateKey];
+  if (!state) {
+    return;
+  }
+
+  const numPrice = Number(price);
+  if (!Number.isFinite(numPrice) || numPrice <= 0) {
+    return;
+  }
+  if (!isReasonablePriceForState(stateKey, numPrice)) {
+    return;
+  }
+
+  state.latestPrice = numPrice;
+  state.lastUpdated = new Date().toISOString();
+  if (state.source !== "angel-live") {
+    state.source = source;
+  }
+  state.connected = true;
+  emitLiveState(stateKey);
+};
+
 const startLiveMarketFeed = async () => {
   if (liveFeedStarted) {
     return;
@@ -1165,10 +1193,14 @@ const startLiveMarketFeed = async () => {
     return liveFeedStartPromise;
   }
 
+  startHistoricalBackfillRetry();
+  backfillHistoricalCandles().catch(() => {});
+  startMarketDataPolling();
+
   liveFeedStartPromise = subscribeLiveTicks()
     .then(() => {
       liveFeedStarted = true;
-      startHistoricalBackfillRetry();
+      liveFeedStatus.started = true;
       return backfillHistoricalCandles();
     })
     .catch((error) => {
@@ -1176,23 +1208,53 @@ const startLiveMarketFeed = async () => {
       liveFeedStartPromise = null;
       liveFeedStatus.started = false;
       liveFeedStatus.lastError = formatError(error);
-      throw error;
+      console.warn("Live market WebSocket connect failed, retrying in 30s; using polling/AI engine feeds:", liveFeedStatus.lastError);
+      setTimeout(() => {
+        if (!liveFeedStarted) {
+          startLiveMarketFeed().catch(() => {});
+        }
+      }, 30000);
+      return null;
     });
 
   return liveFeedStartPromise;
 };
 
 const getLiveMarketSnapshot = (symbol) => {
-  const stateKey = getLiveInstrumentConfig(symbol).stateKey;
+  const config = getLiveInstrumentConfig(symbol);
+  const stateKey = config ? config.stateKey : normalizeSymbol(symbol);
   const state = liveMarketState[stateKey];
+
+  if (!state) {
+    return {
+      symbol: String(symbol || "").toUpperCase(),
+      ticker: "",
+      source: "unknown",
+      connected: false,
+      latestPrice: null,
+      lastUpdated: null,
+      candles: []
+    };
+  }
+
+  let latestPrice = state.latestPrice;
+  let lastUpdated = state.lastUpdated;
+
+  if ((!latestPrice || !Number.isFinite(Number(latestPrice))) && Array.isArray(state.candles) && state.candles.length > 0) {
+    const lastCandle = state.candles[state.candles.length - 1];
+    latestPrice = Number(lastCandle.close);
+    lastUpdated = lastCandle.time;
+    state.latestPrice = latestPrice;
+    state.lastUpdated = lastUpdated;
+  }
 
   return {
     symbol: state.symbol,
     ticker: state.ticker,
     source: state.source,
     connected: state.connected,
-    latestPrice: state.latestPrice,
-    lastUpdated: state.lastUpdated,
+    latestPrice,
+    lastUpdated,
     candles: [...state.candles]
   };
 };
@@ -1250,7 +1312,16 @@ const placeOrder = async (trade, context = {}) => {
     }
   } catch (error) {
     console.error("Option quote fetch failed:", formatError(error));
-    throw error;
+    if (!PAPER_MODE && ENABLE_REAL_TRADING) {
+      throw error;
+    }
+    const fallbackPrice = Number(quoteContext.estimatedOptionPrice || quoteContext.currentOptionPrice || 0);
+    if (!Number.isFinite(fallbackPrice) || fallbackPrice <= 0) {
+      throw error;
+    }
+    quoteContext.currentOptionPrice = fallbackPrice;
+    quoteContext.estimatedOptionPrice = fallbackPrice;
+    quoteContext.quoteSource = "estimated_quote";
   }
 
   if (PAPER_MODE || !ENABLE_REAL_TRADING) {
@@ -1361,6 +1432,7 @@ module.exports = {
   getQuantityForTrade,
   startLiveMarketFeed,
   getLiveMarketSnapshot,
+  updateLiveMarketSpotPrice,
   subscribeToLiveMarket,
   getLiveMarketFeedStatus
 };

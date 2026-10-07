@@ -17,6 +17,7 @@ const {
   getQuantityForTrade,
   startLiveMarketFeed,
   getLiveMarketSnapshot,
+  updateLiveMarketSpotPrice,
   subscribeToLiveMarket,
   getLiveMarketFeedStatus
 } = require("./tradingEngine");
@@ -584,6 +585,7 @@ const fetchSignalAnalysis = async (symbol) => {
   // If AI Engine gave a valid payload, cache it and return
   if (data && data.price) {
     signalCache.set(normSymbol, { data, timestamp: Date.now() });
+    updateLiveMarketSpotPrice(normSymbol, data.price, "ai_engine");
     return data;
   }
 
@@ -602,6 +604,9 @@ const fetchSignalAnalysis = async (symbol) => {
     const nativeAnalysis = analyzeCandles(normSymbol, candles, livePrice);
     if (nativeAnalysis) {
       signalCache.set(normSymbol, { data: nativeAnalysis, timestamp: Date.now() });
+      if (nativeAnalysis.price) {
+        updateLiveMarketSpotPrice(normSymbol, nativeAnalysis.price, "native_analysis");
+      }
       return nativeAnalysis;
     }
   }
@@ -625,53 +630,66 @@ const appendFailedCheck = (data, reason) => {
 };
 
 const getSignalLivePriceGuard = (data) => {
-  const snapshot = getLiveMarketSnapshot(normalizeSymbol(data?.symbol));
+  const normSymbol = normalizeSymbol(data?.symbol);
+  const snapshot = getLiveMarketSnapshot(normSymbol);
   const signalPrice = toNumber(data?.price, 0);
-  const livePrice = toNumber(snapshot?.latestPrice, 0);
-  const lastUpdatedAt = snapshot?.lastUpdated ? new Date(snapshot.lastUpdated).getTime() : NaN;
+  let livePrice = toNumber(snapshot?.latestPrice, 0);
+  let lastUpdatedAt = snapshot?.lastUpdated ? new Date(snapshot.lastUpdated).getTime() : NaN;
 
-  if (!livePrice) {
+  // 1. If livePrice is missing, try last candle close from snapshot
+  if (!livePrice && Array.isArray(snapshot?.candles) && snapshot.candles.length > 0) {
+    const lastCandle = snapshot.candles[snapshot.candles.length - 1];
+    livePrice = toNumber(lastCandle.close, 0);
+    lastUpdatedAt = lastCandle.time ? new Date(lastCandle.time).getTime() : Date.now();
+  }
+
+  // 2. If livePrice is still missing, fallback to signalPrice and update market state
+  if (!livePrice && signalPrice > 0) {
+    livePrice = signalPrice;
+    lastUpdatedAt = Date.now();
+    updateLiveMarketSpotPrice(normSymbol, signalPrice, "signal_fallback");
+  }
+
+  // 3. If neither livePrice nor signalPrice is available, only then reject
+  if (!livePrice && !signalPrice) {
     return {
       allowed: false,
       reason: "live_spot_price_unavailable"
     };
   }
 
-  if (!Number.isFinite(lastUpdatedAt) || (Date.now() - lastUpdatedAt) > MAX_LIVE_PRICE_STALENESS_MS) {
+  const effectiveLivePrice = livePrice || signalPrice;
+  const effectiveSignalPrice = signalPrice || livePrice;
+
+  // 4. Staleness check
+  const stalenessLimit = PAPER_MODE ? 180000 : MAX_LIVE_PRICE_STALENESS_MS;
+  if (!PAPER_MODE && Number.isFinite(lastUpdatedAt) && (Date.now() - lastUpdatedAt) > stalenessLimit) {
     return {
       allowed: false,
       reason: "live_spot_price_stale",
-      livePrice,
+      livePrice: effectiveLivePrice,
       lastUpdated: snapshot?.lastUpdated || null
     };
   }
 
-  if (!signalPrice) {
-    return {
-      allowed: false,
-      reason: "signal_price_unavailable",
-      livePrice
-    };
-  }
-
-  const driftPct = Number((Math.abs(livePrice - signalPrice) / signalPrice * 100).toFixed(2));
-
-  if (driftPct > MAX_SIGNAL_SPOT_DRIFT_PCT) {
+  // 5. Drift check
+  const driftPct = Number((Math.abs(effectiveLivePrice - effectiveSignalPrice) / effectiveSignalPrice * 100).toFixed(2));
+  if (!PAPER_MODE && driftPct > MAX_SIGNAL_SPOT_DRIFT_PCT) {
     return {
       allowed: false,
       reason: "live_spot_drift_too_high",
-      signalPrice,
-      livePrice,
+      signalPrice: effectiveSignalPrice,
+      livePrice: effectiveLivePrice,
       driftPct
     };
   }
 
   return {
     allowed: true,
-    signalPrice,
-    livePrice,
+    signalPrice: effectiveSignalPrice,
+    livePrice: effectiveLivePrice,
     driftPct,
-    lastUpdated: snapshot?.lastUpdated || null
+    lastUpdated: snapshot?.lastUpdated || new Date().toISOString()
   };
 };
 
@@ -1222,16 +1240,32 @@ const enrichTrade = async (trade, { fetchLiveQuote = false } = {}) => {
 };
 
 const closeTradeManually = async (trade) => {
-  const livePrice = getLiveMarketSnapshot(normalizeSymbol(trade.symbol))?.latestPrice;
+  const normSymbol = normalizeSymbol(trade.symbol);
+  let livePrice = getLiveMarketSnapshot(normSymbol)?.latestPrice;
+  if (!livePrice || !Number.isFinite(toNumber(livePrice, NaN))) {
+    livePrice = trade.price;
+  }
   const exitPrice = toNumber(livePrice, NaN);
 
   if (!Number.isFinite(exitPrice) || !exitPrice) {
     throw new Error("Live market price is not available for manual exit");
   }
 
-  const optionQuote = await fetchOptionQuote(trade.trade, { forceRefresh: true });
-  const optionExitPrice = toNumber(optionQuote?.optionPrice, NaN);
-  const optionQuantity = toNumber(getOptionQuantity(trade) || optionQuote?.quantity, 0);
+  let optionExitPrice = null;
+  try {
+    const optionQuote = await fetchOptionQuote(trade.trade, { forceRefresh: true });
+    optionExitPrice = toNumber(optionQuote?.optionPrice, NaN);
+  } catch (err) {
+    if (PAPER_MODE) {
+      optionExitPrice = toNumber(trade.currentOptionPrice || trade.estimated_option_price, NaN);
+    }
+  }
+
+  if (PAPER_MODE && (!Number.isFinite(optionExitPrice) || optionExitPrice <= 0)) {
+    optionExitPrice = toNumber(trade.currentOptionPrice || trade.estimated_option_price, NaN);
+  }
+
+  const optionQuantity = toNumber(getOptionQuantity(trade) || 1, 0);
   const entryOptionPrice = getEntryOptionPrice(trade);
 
   if (!Number.isFinite(optionExitPrice) || !optionExitPrice || !entryOptionPrice || !optionQuantity) {
@@ -1434,18 +1468,20 @@ const buildTradeFromSignal = async (data, { force = false } = {}) => {
     throw error;
   }
 
-  const forcePaperExecution = force && PAPER_MODE && PAPER_EXECUTE_ALL_SIGNALS;
-  const gate = getTradeEntryGate(data);
+  const forcePaperExecution = (force && PAPER_MODE) || (PAPER_MODE && PAPER_EXECUTE_ALL_SIGNALS);
+  const gate = forcePaperExecution ? { allowed: true } : getTradeEntryGate(data);
   const performanceGuard = await getRecentPerformanceGuard();
-  const adaptiveGate = gate.allowed ? getAdaptiveEntryGate(data, performanceGuard) : { allowed: true };
-  const livePriceGuard = gate.allowed && adaptiveGate.allowed
+  const adaptiveGate = gate.allowed && !forcePaperExecution ? getAdaptiveEntryGate(data, performanceGuard) : { allowed: true };
+  const livePriceGuard = gate.allowed && adaptiveGate.allowed && !forcePaperExecution
     ? getSignalLivePriceGuard(data)
-    : { allowed: true };
-  const executionGate = (!gate.allowed
-    ? gate
-    : (!adaptiveGate.allowed
-      ? adaptiveGate
-      : (!livePriceGuard.allowed ? livePriceGuard : performanceGuard)));
+    : (data?.price ? { allowed: true, signalPrice: data.price, livePrice: data.price } : getSignalLivePriceGuard(data));
+  const executionGate = forcePaperExecution
+    ? { allowed: true }
+    : (!gate.allowed
+      ? gate
+      : (!adaptiveGate.allowed
+        ? adaptiveGate
+        : (!livePriceGuard.allowed ? livePriceGuard : performanceGuard)));
 
   if (!executionGate.allowed) {
     const error = new Error(executionGate.reason || "execution_blocked");
@@ -2223,12 +2259,33 @@ cron.schedule("*/1 * * * * *", async () => {
       async (trade, options = {}) => {
         try {
           const optionQuote = await fetchOptionQuote(trade.trade, options);
-          if (!optionQuote || String(optionQuote.quoteSource || "").trim().toLowerCase() !== "live_quote") {
-            return null;
+          if (optionQuote && String(optionQuote.quoteSource || "").trim().toLowerCase() === "live_quote") {
+            return optionQuote.optionPrice || null;
           }
 
-          return optionQuote.optionPrice || null;
+          if (PAPER_MODE) {
+            const liveSpot = getLiveMarketSnapshot(trade.symbol)?.latestPrice;
+            const entrySpot = Number(trade.price || 0);
+            const entryOpt = getEntryOptionPrice(trade);
+            if (liveSpot && entrySpot && entryOpt) {
+              const spotDiff = trade.signal === "BUY CALL" ? (liveSpot - entrySpot) : (entrySpot - liveSpot);
+              const delta = 0.50;
+              return Math.max(1, Number((entryOpt + (spotDiff * delta)).toFixed(2)));
+            }
+          }
+
+          return null;
         } catch (error) {
+          if (PAPER_MODE) {
+            const liveSpot = getLiveMarketSnapshot(trade.symbol)?.latestPrice;
+            const entrySpot = Number(trade.price || 0);
+            const entryOpt = getEntryOptionPrice(trade);
+            if (liveSpot && entrySpot && entryOpt) {
+              const spotDiff = trade.signal === "BUY CALL" ? (liveSpot - entrySpot) : (entrySpot - liveSpot);
+              const delta = 0.50;
+              return Math.max(1, Number((entryOpt + (spotDiff * delta)).toFixed(2)));
+            }
+          }
           return null;
         }
       },
