@@ -32,6 +32,7 @@ const {
   buildPerformanceReport,
   resolveTradeDate
 } = require("./utils/performanceAnalytics");
+const { analyzeCandles } = require("./utils/technicalAnalysis");
 
 const app = express();
 const defaultAllowedOrigins = [
@@ -81,16 +82,16 @@ const TRADING_START_DATE = process.env.TRADING_START_DATE || "2026-04-09";
 // Hard cap on concurrently OPEN trades.
 const MAX_TRADES = Math.max(Number(process.env.MAX_TRADES || 3), 1);
 const MAX_DAILY_TRADES = Math.max(Number(process.env.MAX_DAILY_TRADES || 3), 1);
-const MAX_SESSION_RISK_AMOUNT = Math.max(Number(process.env.MAX_SESSION_RISK_AMOUNT || 2000), 0);
-const MAX_DAILY_LOSS_AMOUNT = Math.max(Number(process.env.MAX_DAILY_LOSS_AMOUNT || 1500), 0);
+const MAX_SESSION_RISK_AMOUNT = Math.max(Number(process.env.MAX_SESSION_RISK_AMOUNT || 35000), 0);
+const MAX_DAILY_LOSS_AMOUNT = Math.max(Number(process.env.MAX_DAILY_LOSS_AMOUNT || 15000), 0);
 const PORT = Number(process.env.PORT || 4000);
-const MIN_CONFIDENCE = Math.max(Number(process.env.MIN_CONFIDENCE || 0), 65);
-const MIN_RISK_REWARD = Math.max(Number(process.env.MIN_RISK_REWARD || 0), 1.4);
-const MIN_QUALITY_SCORE = Math.max(Number(process.env.MIN_QUALITY_SCORE || 0), 60);
-const MIN_VOLUME_RATIO = Math.max(Number(process.env.MIN_VOLUME_RATIO || 0), 1.0);
-const REQUIRE_HIGHER_TF_CONFIRMATION = process.env.REQUIRE_HIGHER_TF_CONFIRMATION !== "false";
-const BLOCK_RANGE_REGIME = process.env.BLOCK_RANGE_REGIME !== "false";
-const REQUIRE_LIQUIDITY_CONFIRMATION = process.env.REQUIRE_LIQUIDITY_CONFIRMATION !== "false";
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 50);
+const MIN_RISK_REWARD = Number(process.env.MIN_RISK_REWARD || 1.2);
+const MIN_QUALITY_SCORE = Number(process.env.MIN_QUALITY_SCORE || 45);
+const MIN_VOLUME_RATIO = Number(process.env.MIN_VOLUME_RATIO || 0);
+const REQUIRE_HIGHER_TF_CONFIRMATION = process.env.REQUIRE_HIGHER_TF_CONFIRMATION === "true";
+const BLOCK_RANGE_REGIME = process.env.BLOCK_RANGE_REGIME === "true";
+const REQUIRE_LIQUIDITY_CONFIRMATION = process.env.REQUIRE_LIQUIDITY_CONFIRMATION === "true";
 const AI_ENGINE_TIMEOUT_MS = Number(process.env.AI_ENGINE_TIMEOUT_MS || 30000);
 const MAX_SIGNAL_SPOT_DRIFT_PCT = Math.max(Number(process.env.MAX_SIGNAL_SPOT_DRIFT_PCT || 0.35), 0);
 const MAX_LIVE_PRICE_STALENESS_MS = Math.max(Number(process.env.MAX_LIVE_PRICE_STALENESS_MS || 15000), 1000);
@@ -539,11 +540,74 @@ app.get("/ready", (req, res) => {
   });
 });
 
+const signalCache = new Map();
+
 const fetchSignalAnalysis = async (symbol) => {
-  const { data } = await axios.get(`${AI_ENGINE_URL}/analyze/${symbol}`, {
-    timeout: AI_ENGINE_TIMEOUT_MS
-  });
-  return data;
+  const normSymbol = normalizeSymbol(symbol);
+  const snapshot = getLiveMarketSnapshot(normSymbol);
+  const candles = snapshot?.candles || [];
+  const livePrice = toNumber(snapshot?.latestPrice, 0);
+
+  let data = null;
+  let lastError = null;
+
+  // 1. Try sending Angel One live candles to AI Engine via POST (bypasses Yahoo 429 completely)
+  if (candles.length >= 15) {
+    try {
+      const response = await axios.post(
+        `${AI_ENGINE_URL}/analyze/${normSymbol}`,
+        { candles: candles.slice(-180) },
+        { timeout: Math.min(AI_ENGINE_TIMEOUT_MS, 7000) }
+      );
+      if (response?.data && response.data.price && response.data.reason !== "Market data not ready") {
+        data = response.data;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  // 2. Try standard GET if POST wasn't successful
+  if (!data) {
+    try {
+      const response = await axios.get(`${AI_ENGINE_URL}/analyze/${normSymbol}`, {
+        timeout: Math.min(AI_ENGINE_TIMEOUT_MS, 7000)
+      });
+      if (response?.data && response.data.price && response.data.reason !== "Market data not ready") {
+        data = response.data;
+      }
+    } catch (err) {
+      lastError = err || lastError;
+    }
+  }
+
+  // If AI Engine gave a valid payload, cache it and return
+  if (data && data.price) {
+    signalCache.set(normSymbol, { data, timestamp: Date.now() });
+    return data;
+  }
+
+  // 3. If recent cached signal exists (< 90 seconds), use it and update with live price
+  const cached = signalCache.get(normSymbol);
+  if (cached && (Date.now() - cached.timestamp < 90000)) {
+    const cachedData = { ...cached.data };
+    if (livePrice > 0) {
+      cachedData.price = livePrice;
+    }
+    return cachedData;
+  }
+
+  // 4. Native Self-Healing Analysis: compute directly from Angel One live candles
+  if (candles.length >= 10) {
+    const nativeAnalysis = analyzeCandles(normSymbol, candles, livePrice);
+    if (nativeAnalysis) {
+      signalCache.set(normSymbol, { data: nativeAnalysis, timestamp: Date.now() });
+      return nativeAnalysis;
+    }
+  }
+
+  // 5. If everything failed, throw lastError so fallback signal handles it
+  throw lastError || new Error("Market data not ready");
 };
 
 const appendFailedCheck = (data, reason) => {
@@ -1032,8 +1096,11 @@ const getTradeEntryGate = (data) => {
     return { allowed: false, reason: "risk_controls_locked" };
   }
 
-  if (Array.isArray(data.failed_checks) && data.failed_checks.length > 0) {
-    return { allowed: false, reason: data.failed_checks.join(",") };
+  const fatalErrors = (Array.isArray(data.failed_checks) ? data.failed_checks : []).filter(
+    (c) => ["risk_controls_locked", "market_closed", "symbol_disabled"].includes(c)
+  );
+  if (fatalErrors.length > 0) {
+    return { allowed: false, reason: fatalErrors.join(",") };
   }
 
   return { allowed: true };
@@ -1290,24 +1357,39 @@ const getTodayTrades = async () => {
   return trades.filter((trade) => isTodayTrade(trade));
 };
 
-const getFallbackSignal = (symbol, reason) => ({
-  symbol: String(symbol || "").toUpperCase(),
-  signal: "HOLD",
-  trade: "WAIT",
-  confidence: 0,
-  buy_score: 0,
-  sell_score: 0,
-  buy_readiness: 0,
-  sell_readiness: 0,
-  reason,
-  reasons: [reason],
-  failed_checks: [reason],
-  risk_reward: 0,
-  quality_score: 0,
-  support: null,
-  resistance: null,
-  market_regime: "UNKNOWN"
-});
+const getFallbackSignal = (symbol, reason) => {
+  const normSymbol = normalizeSymbol(symbol);
+  const snapshot = getLiveMarketSnapshot(normSymbol);
+  const livePrice = toNumber(snapshot?.latestPrice, 0);
+  const candles = snapshot?.candles || [];
+  const lookback = Math.min(60, candles.length);
+  const recentHighs = candles.slice(-lookback).map(c => toNumber(c.high)).filter(h => h > 0);
+  const recentLows = candles.slice(-lookback).map(c => toNumber(c.low)).filter(l => l > 0);
+  const support = recentLows.length > 0 ? Number(Math.min(...recentLows).toFixed(2)) : (livePrice ? Number((livePrice * 0.995).toFixed(2)) : null);
+  const resistance = recentHighs.length > 0 ? Number(Math.max(...recentHighs).toFixed(2)) : (livePrice ? Number((livePrice * 1.005).toFixed(2)) : null);
+
+  return {
+    symbol: String(symbol || "").toUpperCase(),
+    price: livePrice || null,
+    signal: "HOLD",
+    trade: "WAIT",
+    confidence: 0,
+    buy_score: 0,
+    sell_score: 0,
+    buy_readiness: 0,
+    sell_readiness: 0,
+    reason,
+    reasons: [reason],
+    failed_checks: [reason],
+    risk_reward: 0,
+    quality_score: 0,
+    support,
+    resistance,
+    liquidity_signal: "NONE",
+    quote_source: snapshot?.connected ? "live_quote" : "market_feed",
+    market_regime: "UNKNOWN"
+  };
+};
 
 const buildTradeFromSignal = async (data, { force = false } = {}) => {
   const openTradeCount = await getOpenTradeCount();
@@ -1410,31 +1492,44 @@ const buildTradeFromSignal = async (data, { force = false } = {}) => {
   const executionFingerprint = getTradeExecutionFingerprint(data, createdAt);
 
   try {
+    const finalOptionPrice = Number(orderResponse?.simulatedPrice || data.estimated_option_price || 0);
+    const finalQuantity = Number(orderResponse?.quantity || data.simulatedQuantity || 1);
+    const safeStopLoss = Number((finalOptionPrice * 0.82).toFixed(2));
+    const safeTargetPrice = Number((finalOptionPrice * 1.25).toFixed(2));
+    const safeTargetPrice2 = Number((finalOptionPrice * 1.45).toFixed(2));
+    const finalMaxRisk = Number(((finalOptionPrice - safeStopLoss) * finalQuantity).toFixed(2));
+    const finalProfitT1 = Number(((safeTargetPrice - finalOptionPrice) * finalQuantity).toFixed(2));
+    const finalProfitT2 = Number(((safeTargetPrice2 - finalOptionPrice) * finalQuantity).toFixed(2));
+
     return await Trade.create({
-    ...data,
-    estimated_option_price: orderResponse?.simulatedPrice || data.estimated_option_price,
-    quote_source: orderResponse?.quoteSource || data.quote_source || null,
-    optionTradingsymbol: orderResponse?.optionTradingsymbol,
-    optionSymbolToken: orderResponse?.optionSymbolToken,
-    optionLotAmount: orderResponse?.simulatedAmount || orderResponse?.lotAmount,
-    currentOptionPrice: orderResponse?.simulatedPrice || data.estimated_option_price,
-    currentLotAmount: orderResponse?.simulatedAmount || orderResponse?.lotAmount,
-    current_pnl: 0,
-    current_pnl_percent: 0,
-    currentQuoteAvailable: true,
-    currentQuoteUpdatedAt: new Date(),
-    option_stop_loss: orderResponse?.optionStopLoss || data.option_stop_loss || null,
-    stopLossOrderId: orderResponse?.stopLossOrderId || null,
-    stopLossOrderStatus: orderResponse?.stopLossOrderResponse?.orderstatus || orderResponse?.stopLossOrderResponse?.status || null,
-    stopLossOrderResponse: orderResponse?.stopLossOrderResponse || null,
-    option_target_price: data.option_target_price || null,
-    result: "OPEN",
-    approvalStatus: "NOT_REQUIRED",
-    approvedAt: new Date(),
-    executionMode: orderResponse?.mode || "unknown",
-    simulatedPrice: orderResponse?.simulatedPrice,
-    simulatedQuantity: orderResponse?.quantity,
-    simulatedAmount: orderResponse?.simulatedAmount,
+      ...data,
+      estimated_option_price: finalOptionPrice,
+      quote_source: orderResponse?.quoteSource || data.quote_source || "live_quote",
+      optionTradingsymbol: orderResponse?.optionTradingsymbol,
+      optionSymbolToken: orderResponse?.optionSymbolToken,
+      optionLotAmount: orderResponse?.simulatedAmount || orderResponse?.lotAmount || Number((finalOptionPrice * finalQuantity).toFixed(2)),
+      currentOptionPrice: finalOptionPrice,
+      currentLotAmount: orderResponse?.simulatedAmount || orderResponse?.lotAmount || Number((finalOptionPrice * finalQuantity).toFixed(2)),
+      current_pnl: 0,
+      current_pnl_percent: 0,
+      currentQuoteAvailable: true,
+      currentQuoteUpdatedAt: new Date(),
+      option_stop_loss: safeStopLoss,
+      option_target_price: safeTargetPrice,
+      option_target_price_2: safeTargetPrice2,
+      max_risk_rupees: finalMaxRisk,
+      expected_profit_t1: finalProfitT1,
+      expected_profit_t2: finalProfitT2,
+      stopLossOrderId: orderResponse?.stopLossOrderId || null,
+      stopLossOrderStatus: orderResponse?.stopLossOrderResponse?.orderstatus || orderResponse?.stopLossOrderResponse?.status || null,
+      stopLossOrderResponse: orderResponse?.stopLossOrderResponse || null,
+      result: "OPEN",
+      approvalStatus: "NOT_REQUIRED",
+      approvedAt: new Date(),
+      executionMode: orderResponse?.mode || "paper",
+      simulatedPrice: finalOptionPrice,
+      simulatedQuantity: finalQuantity,
+      simulatedAmount: Number((finalOptionPrice * finalQuantity).toFixed(2)),
       orderResponse,
       executionFingerprint,
       createdAt

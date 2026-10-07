@@ -12,9 +12,9 @@ const OPTION_QUOTE_FAILURE_BACKOFF_MS = Math.max(Number(process.env.ANGEL_OPTION
 const PAPER_OPTION_TARGET_MIN_GAIN_PCT = Math.max(Number(process.env.PAPER_OPTION_TARGET_MIN_GAIN_PCT || 0.20), 0.01);
 const PAPER_OPTION_TARGET_SPOT_MULTIPLIER = Math.max(Number(process.env.PAPER_OPTION_TARGET_SPOT_MULTIPLIER || 28), 1);
 const PAPER_OPTION_TARGET_LIQUIDITY_BONUS = Math.max(Number(process.env.PAPER_OPTION_TARGET_LIQUIDITY_BONUS || 1.5), 1);
-const PAPER_BREAKEVEN_R_MULTIPLIER = Math.max(Number(process.env.PAPER_BREAKEVEN_R_MULTIPLIER || 1.6), 0.5);
-const PAPER_TRAILING_R_MULTIPLIER = Math.max(Number(process.env.PAPER_TRAILING_R_MULTIPLIER || 2.4), 0.5);
-const PAPER_TRAIL_EXIT_R_MULTIPLIER = Math.max(Number(process.env.PAPER_TRAIL_EXIT_R_MULTIPLIER || 2.8), 0.5);
+const PAPER_BREAKEVEN_R_MULTIPLIER = Math.max(Number(process.env.PAPER_BREAKEVEN_R_MULTIPLIER || 0.7), 0.3);
+const PAPER_TRAILING_R_MULTIPLIER = Math.max(Number(process.env.PAPER_TRAILING_R_MULTIPLIER || 1.2), 0.5);
+const PAPER_TRAIL_EXIT_R_MULTIPLIER = Math.max(Number(process.env.PAPER_TRAIL_EXIT_R_MULTIPLIER || 1.5), 0.5);
 const PAPER_MAX_UNDERLYING_DRIFT_PCT_FOR_OPTION_SPIKE = Math.max(Number(process.env.PAPER_MAX_UNDERLYING_DRIFT_PCT_FOR_OPTION_SPIKE || 0.5), 0.05);
 const PAPER_MAX_OPTION_SPIKE_MULTIPLIER = Math.max(Number(process.env.PAPER_MAX_OPTION_SPIKE_MULTIPLIER || 4), 1.5);
 const PAPER_MIN_OPTION_WIN_MULTIPLIER = Math.max(Number(process.env.PAPER_MIN_OPTION_WIN_MULTIPLIER || 1.5), 1.05);
@@ -81,47 +81,40 @@ function isForceExitTimeReached() {
 
 function getOptionLevels(trade) {
   const entryOptionPrice = getEntryOptionPrice(trade);
-  const entrySpotPrice = numeric(trade.price, 0);
-  const stopSpotPrice = numeric(trade.stop_loss, 0);
-  const targetSpotPrice = numeric(trade.target, 0);
 
-  if (!entryOptionPrice || !entrySpotPrice || !stopSpotPrice || !targetSpotPrice) {
+  if (!entryOptionPrice || entryOptionPrice <= 0) {
     return {
       optionStop: numeric(trade.option_stop_loss, 0),
       optionTarget: numeric(trade.option_target_price, 0)
     };
   }
 
-  const spotStopPct = Math.abs(entrySpotPrice - stopSpotPrice) / entrySpotPrice;
-  const spotTargetPct = Math.abs(targetSpotPrice - entrySpotPrice) / entrySpotPrice;
-  const liquiditySignal = String(trade.liquidity_signal || "").trim().toUpperCase();
-  const liquidityConfirmed = ["SWEEP_LOW", "SWEEP_HIGH", "BREAKOUT_UP", "BREAKOUT_DOWN"].includes(liquiditySignal);
-  const volumeRatio = Math.max(0.8, Math.min(numeric(trade.volume_ratio, 1), 1.8));
-  const stopBuffer = liquidityConfirmed
-    ? Math.max(0.38, 1 - (spotStopPct * (0.9 + Math.max(volumeRatio - 1, 0) * 0.3)))
-    : Math.max(0.32, 1 - (spotStopPct * 1.15));
-  const optionTargetFromSpot = entryOptionPrice * (
-    1 + (spotTargetPct * PAPER_OPTION_TARGET_SPOT_MULTIPLIER * (liquidityConfirmed ? PAPER_OPTION_TARGET_LIQUIDITY_BONUS : 1))
-  );
-  const minimumTargetGain = entryOptionPrice * (
-    1 + PAPER_OPTION_TARGET_MIN_GAIN_PCT + Math.max(volumeRatio - 1, 0) * 0.01
-  );
-  const targetBuffer = liquidityConfirmed
-    ? 1 + (spotTargetPct * (1.1 + Math.max(volumeRatio - 1, 0) * 0.35))
-    : 1 + (spotTargetPct * 0.9);
-  const optionStop = numeric(trade.option_stop_loss, entryOptionPrice * stopBuffer);
-  const optionTarget = Math.max(
-    numeric(trade.option_target_price, 0),
-    entryOptionPrice * targetBuffer,
-    optionTargetFromSpot,
-    minimumTargetGain
-  );
+  // Capital-protecting stop loss: max 15% - 18% loss on option
+  const defaultStopPrice = Number((entryOptionPrice * 0.82).toFixed(2));
+  let rawStop = numeric(trade.option_stop_loss, 0);
+  let optionStop;
+  if (!rawStop || rawStop <= 0 || rawStop < entryOptionPrice * 0.75 || rawStop >= entryOptionPrice) {
+    optionStop = defaultStopPrice;
+  } else {
+    optionStop = rawStop;
+  }
+
+  // Capital-building target: at least +20% to +35% gain
+  const defaultTargetPrice = Number((entryOptionPrice * 1.25).toFixed(2));
+  let rawTarget = numeric(trade.option_target_price, 0);
+  let optionTarget;
+  if (!rawTarget || rawTarget <= entryOptionPrice * 1.08) {
+    optionTarget = defaultTargetPrice;
+  } else {
+    optionTarget = Math.max(rawTarget, defaultTargetPrice);
+  }
 
   return {
     optionStop: Number(optionStop.toFixed(2)),
     optionTarget: Number(optionTarget.toFixed(2))
   };
 }
+
 
 function getOptionOpenPnl(trade, optionPrice) {
   const entryOptionPrice = getEntryOptionPrice(trade);
@@ -154,7 +147,14 @@ function getOptionRisk(trade) {
 function stopLossHit(trade, optionPrice) {
   const { optionStop } = getOptionLevels(trade);
   const activeStop = numeric(trade.trailingStop || optionStop, 0);
-  return Boolean(activeStop) && optionPrice <= activeStop;
+  if (Boolean(activeStop) && optionPrice <= activeStop) {
+    return true;
+  }
+  const entryOptionPrice = getEntryOptionPrice(trade);
+  if (entryOptionPrice > 0 && optionPrice <= entryOptionPrice * 0.80) {
+    return true;
+  }
+  return false;
 }
 
 function targetHit(trade, optionPrice) {
@@ -259,6 +259,7 @@ function maybeMoveToBreakeven(trade, optionPrice) {
 
 function updateTrailingStop(trade, optionPrice) {
   const entryOptionPrice = getEntryOptionPrice(trade);
+  const quantity = getOptionQuantity(trade) || 1;
   const risk = getOptionRisk(trade);
   const pnl = getOptionOpenPnl(trade, optionPrice);
 
@@ -268,10 +269,11 @@ function updateTrailingStop(trade, optionPrice) {
 
   const { optionStop } = getOptionLevels(trade);
   const activeStop = numeric(trade.trailingStop || optionStop, 0);
-  const lockPnl = Math.max(risk * 0.5, numeric(trade.maxProfitSeen, 0) * 0.35);
-  const nextStop = Math.max(activeStop, entryOptionPrice + lockPnl);
+  const lockPnl = Math.max(risk * 0.4, numeric(trade.maxProfitSeen, 0) * 0.5);
+  const lockPoints = lockPnl / quantity;
+  const nextStop = Math.max(activeStop, entryOptionPrice + lockPoints);
 
-  if (nextStop !== activeStop) {
+  if (nextStop > activeStop) {
     trade.trailingStop = Number(nextStop.toFixed(2));
     return true;
   }
@@ -288,7 +290,7 @@ function shouldTrailExit(trade, optionPrice) {
     return false;
   }
 
-  return pnl <= best * 0.40;
+  return pnl <= best * 0.60;
 }
 
 async function closeTradePosition(trade, closeTrade, spotExitPrice, optionExitPrice, result, exitReason) {

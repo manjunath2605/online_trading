@@ -26,22 +26,33 @@ const getTradeNetPnl = (trade) => {
 };
 
 const getTradeRiskAmount = (trade) => {
+  const maxRiskRupees = toNumber(trade?.max_risk_rupees, NaN);
   const entryPrice = toNumber(trade?.estimated_option_price, NaN);
   const stopPrice = toNumber(trade?.option_stop_loss, NaN);
-  const fallbackStop = toNumber(trade?.stop_loss, NaN);
-  const quantity = toNumber(trade?.simulatedQuantity, NaN);
-  const fallbackQuantity = toNumber(trade?.optionLotAmount, NaN);
+  const quantity = toNumber(
+    trade?.simulatedQuantity || trade?.optionQuantity || trade?.orderResponse?.quantity || trade?.quantity,
+    toNumber(trade?.optionLotAmount, NaN)
+  );
 
   if (Number.isFinite(entryPrice) && Number.isFinite(stopPrice) && Number.isFinite(quantity) && quantity > 0) {
-    return Number(Math.abs(entryPrice - stopPrice) * quantity);
+    // Both entryPrice and stopPrice must be in the option domain (stopPrice < entryPrice * 2)
+    if (stopPrice > 0 && stopPrice < entryPrice * 2) {
+      const riskPerUnit = Math.abs(entryPrice - stopPrice);
+      const calculatedRisk = Number((riskPerUnit * quantity).toFixed(2));
+      if (Number.isFinite(maxRiskRupees) && maxRiskRupees > 0) {
+        return Math.min(calculatedRisk, maxRiskRupees);
+      }
+      return calculatedRisk;
+    }
   }
 
-  if (Number.isFinite(entryPrice) && Number.isFinite(fallbackStop) && Number.isFinite(quantity) && quantity > 0) {
-    return Number(Math.abs(entryPrice - fallbackStop) * quantity);
+  if (Number.isFinite(maxRiskRupees) && maxRiskRupees > 0) {
+    return maxRiskRupees;
   }
 
-  if (Number.isFinite(entryPrice) && Number.isFinite(stopPrice) && Number.isFinite(fallbackQuantity) && fallbackQuantity > 0) {
-    return Number(Math.abs(entryPrice - stopPrice) * fallbackQuantity);
+  // Fallback: Default to max 20% risk of total option position value
+  if (Number.isFinite(entryPrice) && entryPrice > 0 && Number.isFinite(quantity) && quantity > 0) {
+    return Number((entryPrice * quantity * 0.20).toFixed(2));
   }
 
   return 0;
@@ -50,8 +61,9 @@ const getTradeRiskAmount = (trade) => {
 const getSessionRiskSnapshot = ({ trades = [], sessionRiskLimit = 0 } = {}) => {
   const openTrades = (Array.isArray(trades) ? trades : []).filter((trade) => trade?.result === "OPEN" && trade?.duplicateTrade !== true);
   const sessionRiskUsed = openTrades.reduce((sum, trade) => sum + getTradeRiskAmount(trade), 0);
-  const sessionRiskLimitValue = toNumber(sessionRiskLimit, 0);
-  const sessionRiskExceeded = sessionRiskLimitValue > 0 && sessionRiskUsed > sessionRiskLimitValue;
+  const rawLimit = toNumber(sessionRiskLimit, 0);
+  const sessionRiskLimitValue = rawLimit > 0 ? rawLimit : 35000;
+  const sessionRiskExceeded = sessionRiskUsed > sessionRiskLimitValue;
 
   return {
     sessionRiskUsed: Number(sessionRiskUsed.toFixed(2)),
@@ -80,7 +92,8 @@ const getDailyLossSnapshot = ({ trades = [], dailyLossLimit = 0 } = {}) => {
     .reduce((sum, trade) => sum + Math.min(0, toNumber(trade?.current_pnl, 0)), 0);
 
   const dailyPnl = Number((realizedLoss + openLoss).toFixed(2));
-  const dailyLossLimitValue = toNumber(dailyLossLimit, 0);
+  const rawDailyLimit = toNumber(dailyLossLimit, 0);
+  const dailyLossLimitValue = rawDailyLimit > 0 ? rawDailyLimit : 15000;
   const dailyLossExceeded = dailyLossLimitValue > 0 && dailyPnl <= -dailyLossLimitValue;
 
   return {

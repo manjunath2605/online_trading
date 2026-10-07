@@ -673,28 +673,18 @@ const numeric = (value, fallback = 0) => {
 
 const deriveOptionStopLoss = (context = {}) => {
   const entryOptionPrice = numeric(context.currentOptionPrice || context.estimatedOptionPrice, 0);
-  const entrySpotPrice = numeric(context.entrySpotPrice || context.price, 0);
-  const stopSpotPrice = numeric(context.stop_loss, 0);
-  const targetSpotPrice = numeric(context.target, 0);
-
   if (!entryOptionPrice) {
     return numeric(context.option_stop_loss, 0);
   }
 
-  if (!entrySpotPrice || !stopSpotPrice || !targetSpotPrice) {
-    return numeric(context.option_stop_loss, entryOptionPrice * 0.8);
+  const rawStop = numeric(context.option_stop_loss, 0);
+  // Sensible max 18% stop loss on option price
+  const defaultStop = Number((entryOptionPrice * 0.82).toFixed(2));
+  if (!rawStop || rawStop <= 0 || rawStop < entryOptionPrice * 0.75 || rawStop >= entryOptionPrice) {
+    return defaultStop;
   }
 
-  const spotStopPct = Math.abs(entrySpotPrice - stopSpotPrice) / entrySpotPrice;
-  const liquiditySignal = String(context.liquidity_signal || "").trim().toUpperCase();
-  const liquidityConfirmed = ["SWEEP_LOW", "SWEEP_HIGH", "BREAKOUT_UP", "BREAKOUT_DOWN"].includes(liquiditySignal);
-  const volumeRatio = Math.max(0.8, Math.min(numeric(context.volume_ratio, 1), 1.8));
-
-  const stopBuffer = liquidityConfirmed
-    ? Math.max(0.38, 1 - (spotStopPct * (0.9 + Math.max(volumeRatio - 1, 0) * 0.3)))
-    : Math.max(0.32, 1 - (spotStopPct * 1.15));
-
-  return numeric(context.option_stop_loss, entryOptionPrice * stopBuffer);
+  return rawStop;
 };
 
 const buildStopLossTriggerPrice = (trade, context = {}) => {

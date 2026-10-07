@@ -1,6 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+const resolveApiBaseUrl = () => {
+  if (process.env.REACT_APP_API_BASE_URL) {
+    return process.env.REACT_APP_API_BASE_URL.replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    const hostname = window.location.hostname;
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
+      return "http://localhost:4000";
+    }
+  }
+  return "https://online-trading-backend.onrender.com";
+};
 
-const API_BASE_URL = "https://online-trading-backend.onrender.com";
+const API_BASE_URL = resolveApiBaseUrl();
 const CHART_INTERVAL_LABEL = "1s";
 const MIN_VISIBLE = 30;
 const DEFAULT_VISIBLE = 120;

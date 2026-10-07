@@ -10,7 +10,7 @@ from marketStructure import detect_market_structure
 from liquidityEngine import detect_liquidity_sweep
 
 app = Flask(__name__)
-MARKET_DATA_CACHE_TTL_SECONDS = max(int(os.environ.get("MARKET_DATA_CACHE_TTL_SECONDS", 60)), 0)
+MARKET_DATA_CACHE_TTL_SECONDS = max(int(os.environ.get("MARKET_DATA_CACHE_TTL_SECONDS", 120)), 0)
 market_data_cache = {}
 market_data_cache_lock = threading.Lock()
 market_data_fetch_lock = threading.Lock()
@@ -203,11 +203,15 @@ def load_market_data(symbol, period="5d", interval="1m"):
             normalized = None
             app.logger.warning("Yahoo market data fetch failed for %s: %s", config["name"], error)
 
+        if normalized is None and cached and cached[1] is not None:
+            app.logger.info("Using previous cached market data for %s due to Yahoo error/rate limit", config["name"])
+            normalized = cached[1].copy()
+
         elapsed_seconds = time.monotonic() - started_at
         app.logger.info("Yahoo market data fetch for %s took %.2f seconds", config["name"], elapsed_seconds)
 
-        if MARKET_DATA_CACHE_TTL_SECONDS > 0:
-            cached_frame = normalized.copy() if normalized is not None else None
+        if MARKET_DATA_CACHE_TTL_SECONDS > 0 and normalized is not None:
+            cached_frame = normalized.copy()
             with market_data_cache_lock:
                 market_data_cache[cache_key] = (time.monotonic(), cached_frame, config["name"])
 
@@ -489,11 +493,11 @@ def compute_signal_payload(df, symbol_name):
         and volume_ratio >= 1.05
         and price < prev
     )
-    strong_directional_edge = abs(buy_score - sell_score) >= 2.0
+    strong_directional_edge = abs(buy_score - sell_score) >= 1.5
 
-    range_filter = structure == "RANGE" or volume_ratio < 1.0
-    long_entry_allowed = (strict_bullish or trend_long_confirmed or breakout_long_confirmed) and not range_filter and strong_directional_edge and buy_score >= 7.0
-    short_entry_allowed = (strict_bearish or trend_short_confirmed or breakout_short_confirmed) and not range_filter and strong_directional_edge and sell_score >= 7.0
+    range_filter = structure == "RANGE" or (volume_available and volume_ratio < 0.8)
+    long_entry_allowed = (strict_bullish or trend_long_confirmed or breakout_long_confirmed or (buy_score >= 6.0 and higher_tf_bullish and price > ema20)) and not range_filter and strong_directional_edge and buy_score >= 5.5
+    short_entry_allowed = (strict_bearish or trend_short_confirmed or breakout_short_confirmed or (sell_score >= 6.0 and higher_tf_bearish and price < ema20)) and not range_filter and strong_directional_edge and sell_score >= 5.5
 
     if long_entry_allowed:
         signal = "BUY CALL"
@@ -593,9 +597,10 @@ def compute_signal_payload(df, symbol_name):
         "volume_available": bool(volume_available),
         "higher_tf_bullish": bool(higher_tf_bullish),
         "higher_tf_bearish": bool(higher_tf_bearish),
-        "estimated_option_price": round(max(10.0, atr_val * 2.5), 2),
-        "option_stop_loss": round(max(5.0, max(10.0, atr_val * 2.5) * 0.72), 2) if signal != "HOLD" else None,
-        "option_target_price": round(max(12.0, max(10.0, atr_val * 2.5) * (1.35 if signal == "BUY CALL" or signal == "BUY PUT" else 1.2)), 2) if signal != "HOLD" else None,
+        "estimated_option_price": round(max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)), 2),
+        "option_stop_loss": round(max(20.0, max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)) * 0.82), 2) if signal != "HOLD" else None,
+        "option_target_price": round(max(30.0, max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)) * 1.25), 2) if signal != "HOLD" else None,
+        "option_target_price_2": round(max(35.0, max(25.0, atr_val * (2.2 if "BANK" in symbol_name else 2.5)) * 1.45), 2) if signal != "HOLD" else None,
         "score_breakdown": {
             "bullish_quality_bonus": round(bullish_quality_bonus, 2),
             "bearish_quality_bonus": round(bearish_quality_bonus, 2),
@@ -610,12 +615,51 @@ def get_data(symbol, period="5d", interval="1m"):
     return load_market_data(symbol, period=period, interval=interval)
 
 
-@app.route("/analyze/<symbol>")
+def candles_to_dataframe(candles_list):
+    if not candles_list or not isinstance(candles_list, list):
+        return None
+    rows = []
+    for c in candles_list:
+        if not isinstance(c, dict):
+            continue
+        try:
+            t = c.get("time") or c.get("timestamp")
+            o = float(c.get("open", 0))
+            h = float(c.get("high", 0))
+            l = float(c.get("low", 0))
+            cl = float(c.get("close", 0))
+            v = float(c.get("volume", 0))
+            rows.append({"time": t, "Open": o, "High": h, "Low": l, "Close": cl, "Volume": v})
+        except (ValueError, TypeError):
+            continue
+    if len(rows) < 10:
+        return None
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).set_index("time").sort_index()
+    return normalize_market_data(df)
+
+
+@app.route("/analyze/<symbol>", methods=["GET", "POST"])
 def analyze(symbol):
     try:
-        df, name = get_data(symbol)
+        config = get_symbol_config(symbol)
+        name = config["name"] if config else str(symbol).upper()
+        df = None
+
+        if request.method == "POST" and request.is_json:
+            payload = request.get_json(silent=True) or {}
+            candles_list = payload.get("candles")
+            if candles_list:
+                df = candles_to_dataframe(candles_list)
+
         if df is None:
-            return jsonify(build_hold_payload(symbol, "Market data not ready"))
+            df, fetched_name = get_data(symbol)
+            if fetched_name:
+                name = fetched_name
+
+        if df is None or len(df) < 10:
+            return jsonify(build_hold_payload(symbol, "Market data not ready", name=name))
 
         return jsonify(compute_signal_payload(df, name))
     except Exception as error:
