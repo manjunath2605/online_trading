@@ -758,9 +758,9 @@ const realTrade = async (trade, context = {}) => realBrokerOrder(trade, "BUY", c
 const realExitTrade = async (trade, context = {}) => realBrokerOrder(trade, "SELL", context);
 
 const getLiveInstrumentConfig = (symbol) => {
-  const normalized = String(symbol || "").toLowerCase();
+  const normalized = String(symbol || "").trim().toLowerCase();
 
-  if (normalized === "nifty") {
+  if (normalized === "nifty" || normalized === "nifty 50" || normalized === "^nsei") {
     return {
       stateKey: "nifty",
       symbol: "NIFTY",
@@ -770,7 +770,7 @@ const getLiveInstrumentConfig = (symbol) => {
     };
   }
 
-  if (normalized === "banknifty") {
+  if (normalized === "banknifty" || normalized === "bank nifty" || normalized === "^nsebank") {
     return {
       stateKey: "banknifty",
       symbol: "BANKNIFTY",
@@ -1380,9 +1380,6 @@ const closeTrade = async (trade, context = {}) => {
   }
 
   if (PAPER_MODE || !ENABLE_REAL_TRADING) {
-    if (String(quoteContext.quoteSource || "").toLowerCase() !== "live_quote") {
-      return null;
-    }
     return buildSimulatedExit(trade, quoteContext);
   }
 

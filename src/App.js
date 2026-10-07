@@ -70,47 +70,17 @@ const formatDayLabel = (value) => {
 
 const getTradeDirection = (trade) => (trade?.signal === "BUY PUT" ? -1 : 1);
 
-const getTradeClosedPnl = (trade) => {
-  const quoteSource = String(trade?.quote_reliability || trade?.quote_source || "").trim().toLowerCase();
-  if (quoteSource === "stale_quote" || quoteSource === "rejected_no_quote") {
-    return 0;
-  }
-
-  if (typeof trade?.lotPnl === "number") {
-    return Number(trade.lotPnl.toFixed(2));
-  }
-
-  const entry = toNumber(trade?.price, NaN);
-  const exit = toNumber(trade?.exit_price, NaN);
-  if (!Number.isFinite(entry) || !Number.isFinite(exit)) {
-    return 0;
-  }
-  return Number(((exit - entry) * getTradeDirection(trade)).toFixed(2));
-};
-
-const getTradeOpenPnl = (trade) => {
-  if (typeof trade?.current_pnl === "number") {
-    return Number(trade.current_pnl.toFixed(2));
-  }
-  return 0;
-};
-
-const getTradeNetPnl = (trade) => (trade?.result === "OPEN" ? getTradeOpenPnl(trade) : getTradeClosedPnl(trade));
-const getDisplayLotValue = (trade) => {
-  if (typeof trade?.currentLotAmount === "number" && trade.result === "OPEN") {
-    return trade.currentLotAmount;
-  }
-
-  if (typeof trade?.exitLotAmount === "number") {
-    return trade.exitLotAmount;
-  }
-
-  return null;
-};
-
 const getEntryUnitPrice = (trade) => {
-  if (typeof trade?.estimated_option_price === "number") {
+  if (typeof trade?.estimated_option_price === "number" && trade.estimated_option_price > 0) {
     return trade.estimated_option_price;
+  }
+
+  if (typeof trade?.entryOptionPrice === "number" && trade.entryOptionPrice > 0) {
+    return trade.entryOptionPrice;
+  }
+
+  if (typeof trade?.optionLotAmount === "number" && typeof trade?.optionQuantity === "number" && trade.optionQuantity > 0) {
+    return Number((trade.optionLotAmount / trade.optionQuantity).toFixed(2));
   }
 
   if (typeof trade?.entryLotAmount === "number" && typeof trade?.optionQuantity === "number" && trade.optionQuantity > 0) {
@@ -125,17 +95,130 @@ const getDisplayUnitPrice = (trade) => {
     return trade.currentOptionPrice;
   }
 
-  if (typeof trade?.exitOptionPrice === "number") {
-    return trade.exitOptionPrice;
+  const exitOpt = typeof trade?.exitOptionPrice === "number"
+    ? trade.exitOptionPrice
+    : (typeof trade?.exit_option_price === "number" ? trade.exit_option_price : null);
+
+  if (exitOpt !== null) {
+    return exitOpt;
   }
 
-  const displayLotValue = getDisplayLotValue(trade);
+  if (trade?.result !== "OPEN" && typeof trade?.currentOptionPrice === "number") {
+    return trade.currentOptionPrice;
+  }
+
+  const displayLotValue = typeof trade?.exitLotAmount === "number"
+    ? trade.exitLotAmount
+    : (typeof trade?.exitOptionLotAmount === "number" ? trade.exitOptionLotAmount : null);
   if (typeof displayLotValue === "number" && typeof trade?.optionQuantity === "number" && trade.optionQuantity > 0) {
     return Number((displayLotValue / trade.optionQuantity).toFixed(2));
   }
 
   return null;
 };
+
+const getEntryLotAmount = (trade) => {
+  if (typeof trade?.entryLotAmount === "number") return trade.entryLotAmount;
+  if (typeof trade?.optionLotAmount === "number") return trade.optionLotAmount;
+  const unit = getEntryUnitPrice(trade);
+  const qty = typeof trade?.optionQuantity === "number" ? trade.optionQuantity : (toNumber(trade?.quantity, NaN));
+  if (typeof unit === "number" && typeof qty === "number" && qty > 0) {
+    return Number((unit * qty).toFixed(2));
+  }
+  return null;
+};
+
+const getExitLotAmount = (trade) => {
+  if (trade?.result === "OPEN") {
+    if (typeof trade?.currentLotAmount === "number") return trade.currentLotAmount;
+    const unit = getDisplayUnitPrice(trade);
+    const qty = typeof trade?.optionQuantity === "number" ? trade.optionQuantity : (toNumber(trade?.quantity, NaN));
+    if (typeof unit === "number" && typeof qty === "number" && qty > 0) {
+      return Number((unit * qty).toFixed(2));
+    }
+    return null;
+  }
+
+  if (typeof trade?.exitLotAmount === "number") return trade.exitLotAmount;
+  if (typeof trade?.exitOptionLotAmount === "number") return trade.exitOptionLotAmount;
+  if (typeof trade?.currentLotAmount === "number") return trade.currentLotAmount;
+
+  const unit = getDisplayUnitPrice(trade);
+  const qty = typeof trade?.optionQuantity === "number" ? trade.optionQuantity : (toNumber(trade?.quantity, NaN));
+  if (typeof unit === "number" && typeof qty === "number" && qty > 0) {
+    return Number((unit * qty).toFixed(2));
+  }
+  return null;
+};
+
+const getDisplayLotValue = (trade) => getExitLotAmount(trade);
+
+const getTradeClosedPnl = (trade) => {
+  const quoteSource = String(trade?.quote_reliability || trade?.quote_source || "").trim().toLowerCase();
+  if (quoteSource === "stale_quote" || quoteSource === "rejected_no_quote") {
+    return 0;
+  }
+
+  if (typeof trade?.lotPnl === "number") {
+    return Number(trade.lotPnl.toFixed(2));
+  }
+
+  if (typeof trade?.current_pnl === "number") {
+    return Number(trade.current_pnl.toFixed(2));
+  }
+
+  const exitLot = getExitLotAmount(trade);
+  const entryLot = getEntryLotAmount(trade);
+  if (typeof exitLot === "number" && typeof entryLot === "number") {
+    return Number((exitLot - entryLot).toFixed(2));
+  }
+
+  const entryUnit = getEntryUnitPrice(trade);
+  const exitUnit = getDisplayUnitPrice(trade);
+  const qty = typeof trade?.optionQuantity === "number" ? trade.optionQuantity : (toNumber(trade?.quantity, 1));
+  if (typeof entryUnit === "number" && typeof exitUnit === "number") {
+    return Number(((exitUnit - entryUnit) * qty).toFixed(2));
+  }
+
+  const entry = toNumber(trade?.price, NaN);
+  const exit = toNumber(trade?.exit_price, NaN);
+  if (!Number.isFinite(entry) || !Number.isFinite(exit)) {
+    return 0;
+  }
+  return Number(((exit - entry) * getTradeDirection(trade)).toFixed(2));
+};
+
+const getTradeOpenPnl = (trade) => {
+  const quoteSource = String(trade?.quote_reliability || trade?.quote_source || "").trim().toLowerCase();
+  if (quoteSource === "stale_quote" || quoteSource === "rejected_no_quote") {
+    return 0;
+  }
+
+  if (typeof trade?.lotPnl === "number") {
+    return Number(trade.lotPnl.toFixed(2));
+  }
+
+  if (typeof trade?.current_pnl === "number") {
+    return Number(trade.current_pnl.toFixed(2));
+  }
+
+  const exitLot = getExitLotAmount(trade);
+  const entryLot = getEntryLotAmount(trade);
+  if (typeof exitLot === "number" && typeof entryLot === "number") {
+    return Number((exitLot - entryLot).toFixed(2));
+  }
+
+  const entryUnit = getEntryUnitPrice(trade);
+  const currentUnit = getDisplayUnitPrice(trade);
+  const qty = typeof trade?.optionQuantity === "number" ? trade.optionQuantity : (toNumber(trade?.quantity, 1));
+  if (typeof entryUnit === "number" && typeof currentUnit === "number") {
+    return Number(((currentUnit - entryUnit) * qty).toFixed(2));
+  }
+
+  return 0;
+};
+
+const getTradeNetPnl = (trade) => (trade?.result === "OPEN" ? getTradeOpenPnl(trade) : getTradeClosedPnl(trade));
 
 const calcRsi = (candles, period = 14) => {
   if (!candles.length) return [];
@@ -1154,11 +1237,12 @@ function App() {
                   const pending = trade.approvalStatus === "PENDING";
                   const busy = actioningTradeId === trade._id;
                   const tradePnl = getTradeNetPnl(trade);
+                  const entryLotValue = getEntryLotAmount(trade);
                   const displayLotValue = getDisplayLotValue(trade);
                   const entryUnitPrice = getEntryUnitPrice(trade);
                   const displayUnitPrice = getDisplayUnitPrice(trade);
-                  const optionQuantity = typeof trade.optionQuantity === "number" ? trade.optionQuantity : null;
-                  const lotPnl = typeof trade.lotPnl === "number" ? trade.lotPnl : null;
+                  const optionQuantity = typeof trade.optionQuantity === "number" ? trade.optionQuantity : (trade.quantity || null);
+                  const lotPnl = tradePnl;
                   const quoteReliability = String(trade.quote_reliability || trade.quote_source || "").trim().toLowerCase();
                   const quoteStale = quoteReliability === "stale_quote" || quoteReliability === "rejected_no_quote";
                   const noLiveQuote = trade.result === "OPEN" && quoteStale;
@@ -1202,9 +1286,9 @@ function App() {
                           </>
                         ) : entryUnitPrice !== null && optionQuantity !== null ? (
                           <>
-                            <div>Buy: <b>{typeof trade.entryLotAmount === "number" ? `Rs. ${fmt(trade.entryLotAmount)}` : "-"}</b></div>
+                            <div>Buy: <b>{typeof entryLotValue === "number" ? `Rs. ${fmt(entryLotValue)}` : "-"}</b></div>
                             <div style={{ color: "#64748b", fontSize: 12, marginTop: 4 }}>
-                              {fmt(entryUnitPrice)} x {optionQuantity} = {typeof trade.entryLotAmount === "number" ? `Rs. ${fmt(trade.entryLotAmount)}` : "-"}
+                              {fmt(entryUnitPrice)} x {optionQuantity} = {typeof entryLotValue === "number" ? `Rs. ${fmt(entryLotValue)}` : "-"}
                             </div>
                             <div style={{ color: "#475569", marginTop: 8 }}>{trade.result === "OPEN" ? "Now" : "Sell"}: <b>{typeof displayLotValue === "number" ? `Rs. ${fmt(displayLotValue)}` : "-"}</b></div>
                             {displayUnitPrice !== null && typeof displayLotValue === "number" && (
@@ -1253,9 +1337,14 @@ function App() {
                             Rs. {fmt(tradePnl)}
                           </div>
                         )}
-                        {typeof trade.current_pnl === "number" && (
+                        {trade.result === "OPEN" && typeof trade.current_pnl === "number" && (
                           <div style={{ color: "#64748b", fontSize: 12, marginTop: 6 }}>
                             Live {fmt(trade.current_pnl)} ({trade.current_pnl_percent ?? 0}%)
+                          </div>
+                        )}
+                        {trade.result !== "OPEN" && typeof trade.current_pnl_percent === "number" && (
+                          <div style={{ color: "#64748b", fontSize: 12, marginTop: 6 }}>
+                            {trade.result} ({trade.current_pnl_percent}%)
                           </div>
                         )}
                       </td>

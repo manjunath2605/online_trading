@@ -1139,6 +1139,7 @@ const findRecentDuplicateTrade = async (data, windowMs = Number(process.env.DUPL
 };
 
 const enrichTrade = async (trade, { fetchLiveQuote = false } = {}) => {
+  if (!trade) return null;
   const plainTrade = typeof trade.toObject === "function" ? trade.toObject() : { ...trade };
   const normalizedTradeSymbol = inferNormalizedTradeSymbol(plainTrade);
   const livePrice = getLiveMarketSnapshot(normalizedTradeSymbol)?.latestPrice;
@@ -1193,7 +1194,7 @@ const enrichTrade = async (trade, { fetchLiveQuote = false } = {}) => {
     ?? (Number.isFinite(storedCurrentPnl) ? storedCurrentPnl : (shouldUseUnderlyingFallback ? underlyingPnl : null));
   const closedLotPnl = entryLotAmount !== null && exitLotAmount !== null
     ? Number((exitLotAmount - entryLotAmount).toFixed(2))
-    : null;
+    : (Number.isFinite(storedCurrentPnl) ? storedCurrentPnl : null);
   const lotPnl = plainTrade.result === "OPEN" ? currentPnl : closedLotPnl;
   const storedCurrentPnlPercent = toNumber(plainTrade.current_pnl_percent, NaN);
   const currentPnlPercent = liveOptionPnl !== null && entryLotAmount
@@ -1211,9 +1212,21 @@ const enrichTrade = async (trade, { fetchLiveQuote = false } = {}) => {
       : (quoteSource || null));
   const quoteIsUnreliable = ["stale_quote", "rejected_no_quote"].includes(quoteReliability);
   const suppressUnreliableQuoteMetrics = plainTrade.result === "OPEN" && quoteIsUnreliable;
-  const effectiveCurrentPnl = suppressUnreliableQuoteMetrics ? 0 : currentPnl;
-  const effectiveCurrentPnlPercent = suppressUnreliableQuoteMetrics ? 0 : currentPnlPercent;
-  const effectiveLotPnl = suppressUnreliableQuoteMetrics ? 0 : lotPnl;
+  const effectiveCurrentPnl = plainTrade.result === "OPEN"
+    ? (suppressUnreliableQuoteMetrics ? 0 : currentPnl)
+    : closedLotPnl;
+  const effectiveCurrentPnlPercent = plainTrade.result === "OPEN"
+    ? (suppressUnreliableQuoteMetrics ? 0 : currentPnlPercent)
+    : (entryLotAmount && closedLotPnl !== null ? Number(((closedLotPnl / entryLotAmount) * 100).toFixed(2)) : storedCurrentPnlPercent);
+  const effectiveLotPnl = plainTrade.result === "OPEN"
+    ? (suppressUnreliableQuoteMetrics ? 0 : lotPnl)
+    : closedLotPnl;
+  const effectiveCurrentOptionPrice = plainTrade.result === "OPEN"
+    ? (Number.isFinite(currentOptionPrice) ? currentOptionPrice : null)
+    : (Number.isFinite(exitOptionPrice) ? exitOptionPrice : currentOptionPrice);
+  const effectiveCurrentLotAmount = plainTrade.result === "OPEN"
+    ? currentLotAmount
+    : (exitLotAmount ?? currentLotAmount);
 
   return {
     ...plainTrade,
@@ -1223,10 +1236,10 @@ const enrichTrade = async (trade, { fetchLiveQuote = false } = {}) => {
     optionQuantity: optionQuantity || null,
     quote_source: liveOptionQuote?.quoteSource || plainTrade.quote_source || null,
     quote_reliability: liveOptionQuote?.quoteSource || quoteReliability,
-    currentOptionPrice: Number.isFinite(currentOptionPrice) ? currentOptionPrice : null,
+    currentOptionPrice: effectiveCurrentOptionPrice,
     exitOptionPrice: exitOptionPrice || null,
     entryLotAmount,
-    currentLotAmount,
+    currentLotAmount: effectiveCurrentLotAmount,
     exitLotAmount,
     lotPnl: effectiveLotPnl,
     current_pnl: effectiveCurrentPnl,
@@ -1273,10 +1286,17 @@ const closeTradeManually = async (trade) => {
   }
 
   const pnl = Number(((optionExitPrice - entryOptionPrice) * optionQuantity).toFixed(2));
+  const calculatedExitLotAmount = Number((optionExitPrice * optionQuantity).toFixed(2));
+  const calculatedEntryLotAmount = Number((entryOptionPrice * optionQuantity).toFixed(2));
 
   trade.result = pnl >= 0 ? "WIN" : "LOSS";
   trade.exit_price = exitPrice;
   trade.exit_option_price = optionExitPrice;
+  trade.exitOptionLotAmount = calculatedExitLotAmount;
+  trade.currentOptionPrice = optionExitPrice;
+  trade.currentLotAmount = calculatedExitLotAmount;
+  trade.current_pnl = pnl;
+  trade.current_pnl_percent = calculatedEntryLotAmount > 0 ? Number(((pnl / calculatedEntryLotAmount) * 100).toFixed(2)) : 0;
   trade.exit_reason = "MANUAL_EXIT";
   trade.closedAt = new Date();
   trade.exitOrderResponse = await closeTrade(trade.trade, {
@@ -1284,7 +1304,9 @@ const closeTradeManually = async (trade) => {
     currentOptionPrice: optionExitPrice,
     stopLossOrderId: trade.stopLossOrderId
   });
-  trade.exitOptionLotAmount = toNumber(trade.exitOrderResponse?.exitAmount, 0) || undefined;
+  if (trade.exitOrderResponse?.exitAmount && Number(trade.exitOrderResponse.exitAmount) > 0) {
+    trade.exitOptionLotAmount = Number(trade.exitOrderResponse.exitAmount);
+  }
   await trade.save();
   await sendSignal([
     "Trade exited",
@@ -1309,10 +1331,21 @@ const computeStats = (trades) => {
       return sum + toNumber(trade.lotPnl);
     }
 
-    const entryLotAmount = toNumber(trade.entryLotAmount, NaN);
-    const exitLotAmount = toNumber(trade.exitLotAmount, NaN);
+    if (Number.isFinite(toNumber(trade.current_pnl, NaN))) {
+      return sum + toNumber(trade.current_pnl);
+    }
+
+    const entryLotAmount = toNumber(trade.entryLotAmount || trade.optionLotAmount, NaN);
+    const exitLotAmount = toNumber(trade.exitLotAmount || trade.exitOptionLotAmount, NaN);
     if (Number.isFinite(entryLotAmount) && Number.isFinite(exitLotAmount)) {
       return sum + (exitLotAmount - entryLotAmount);
+    }
+
+    const entryOpt = toNumber(trade.estimated_option_price, NaN);
+    const exitOpt = toNumber(trade.exit_option_price, NaN);
+    const qty = toNumber(trade.optionQuantity || trade.quantity, NaN);
+    if (Number.isFinite(entryOpt) && Number.isFinite(exitOpt) && Number.isFinite(qty) && qty > 0) {
+      return sum + ((exitOpt - entryOpt) * qty);
     }
 
     if (!Number.isFinite(toNumber(trade.exit_price)) || !Number.isFinite(toNumber(trade.price))) {
@@ -1592,6 +1625,10 @@ if (PAPER_MODE && !PAPER_EXECUTE_ALL_SIGNALS) {
 
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection:", formatError(reason));
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", formatError(error));
 });
 
 startLiveMarketFeed().catch((error) => {
@@ -2208,6 +2245,13 @@ app.post("/signals/:symbol/buy", async (req, res) => {
       force: PAPER_MODE
     });
 
+    if (!tradeRecord) {
+      return res.status(409).json({
+        error: "Duplicate trade skipped",
+        details: "A trade with identical parameters already exists for this interval"
+      });
+    }
+
     lastSignals[symbol] = getSignalFingerprint(data);
     await sendSignal(buildTelegramEntryMessage(tradeRecord, data));
     return res.status(201).json(await enrichTrade(tradeRecord));
@@ -2239,7 +2283,7 @@ cron.schedule("*/1 * * * *", async () => {
   noOverlap: true
 });
 
-cron.schedule("*/1 * * * * *", async () => {
+cron.schedule("*/5 * * * * *", async () => {
   if (manageTradesRunning) {
     return;
   }

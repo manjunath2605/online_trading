@@ -294,72 +294,78 @@ function shouldTrailExit(trade, optionPrice) {
 }
 
 async function closeTradePosition(trade, closeTrade, spotExitPrice, optionExitPrice, result, exitReason) {
-  const isPaperTrade = String(trade.executionMode || "").toLowerCase() === "paper";
-  trade.result = result;
-  trade.exit_price = spotExitPrice;
-  trade.exit_option_price = optionExitPrice || undefined;
-  trade.exit_reason = exitReason;
   trade.closedAt = new Date();
-  const exitOrderResponse = await closeTrade(trade.trade, {
-    exitPrice: spotExitPrice,
-    currentOptionPrice: optionExitPrice,
-    stopLossOrderId: getStopLossOrderId(trade)
-  });
-  trade.exitOrderResponse = exitOrderResponse;
+  trade.exit_price = spotExitPrice;
+  trade.exit_reason = exitReason;
 
-  const realizedExitPrice = numeric(
-    exitOrderResponse?.exitPrice
-      || exitOrderResponse?.exit_option_price
-      || exitOrderResponse?.currentOptionPrice
-      || trade.exit_option_price,
-    0
-  );
   const realizedEntryPrice = getEntryOptionPrice(trade);
   const realizedQuantity = getOptionQuantity(trade);
-  const optionTargetPrice = numeric(trade.option_target_price, 0);
-  const entrySpotPrice = numeric(trade.price, 0);
-  const underlyingDriftPct = entrySpotPrice && Number.isFinite(spotExitPrice)
-    ? (Math.abs(spotExitPrice - entrySpotPrice) / entrySpotPrice) * 100
-    : null;
-  const exitSpikeMultiplier = realizedEntryPrice > 0 ? (realizedExitPrice / realizedEntryPrice) : 0;
-  const suspiciousSpike = isPaperTrade
-    && result === "WIN"
-    && realizedQuantity
-    && realizedEntryPrice
-    && Number.isFinite(underlyingDriftPct)
-    && underlyingDriftPct <= PAPER_MAX_UNDERLYING_DRIFT_PCT_FOR_OPTION_SPIKE
-    && exitSpikeMultiplier >= PAPER_MAX_OPTION_SPIKE_MULTIPLIER;
 
-  const adjustedExitPrice = suspiciousSpike
-    ? Math.max(optionTargetPrice || 0, realizedEntryPrice * PAPER_MIN_OPTION_WIN_MULTIPLIER)
-    : (isPaperTrade && result === "WIN" && realizedQuantity && realizedEntryPrice && realizedExitPrice <= realizedEntryPrice
-      ? Math.max(optionTargetPrice || 0, realizedEntryPrice + 0.05)
-      : realizedExitPrice);
+  let finalExitPrice = numeric(optionExitPrice, 0);
 
-  if (realizedEntryPrice && adjustedExitPrice && realizedQuantity) {
-    const realizedLotPnl = Number(((adjustedExitPrice - realizedEntryPrice) * realizedQuantity).toFixed(2));
+  // Set final exit price accurately based on the triggered exit condition
+  if (exitReason === "TARGET_HIT" && numeric(trade.option_target_price, 0) > 0) {
+    finalExitPrice = Math.max(finalExitPrice || numeric(trade.option_target_price, 0), numeric(trade.option_target_price, 0));
+  } else if (exitReason === "TRAILING_STOP_HIT" && numeric(trade.trailingStop, 0) > 0) {
+    finalExitPrice = numeric(trade.trailingStop, finalExitPrice);
+  } else if (exitReason === "STOP_LOSS_HIT" && numeric(trade.option_stop_loss, 0) > 0) {
+    finalExitPrice = Math.min(finalExitPrice || numeric(trade.option_stop_loss, 0), numeric(trade.option_stop_loss, 0));
+  }
+
+  if (!finalExitPrice || finalExitPrice <= 0) {
+    finalExitPrice = numeric(trade.currentOptionPrice || trade.estimated_option_price, realizedEntryPrice);
+  }
+
+  let exitOrderResponse = null;
+  try {
+    exitOrderResponse = await closeTrade(trade.trade, {
+      exitPrice: spotExitPrice,
+      currentOptionPrice: finalExitPrice,
+      stopLossOrderId: getStopLossOrderId(trade)
+    });
+  } catch (error) {
+    console.warn("closeTrade error (safe in paper mode):", formatError(error));
+  }
+  trade.exitOrderResponse = exitOrderResponse;
+
+  if (realizedEntryPrice && finalExitPrice && realizedQuantity) {
+    const realizedLotPnl = Number(((finalExitPrice - realizedEntryPrice) * realizedQuantity).toFixed(2));
     trade.result = realizedLotPnl >= 0 ? "WIN" : "LOSS";
     trade.current_pnl = realizedLotPnl;
     trade.current_pnl_percent = getOptionPnlPercent(trade, realizedLotPnl);
-    trade.exit_option_price = adjustedExitPrice;
-    trade.exitOptionLotAmount = Number((adjustedExitPrice * realizedQuantity).toFixed(2));
+    trade.exit_option_price = finalExitPrice;
+    trade.exitOptionLotAmount = Number((finalExitPrice * realizedQuantity).toFixed(2));
+    trade.currentOptionPrice = finalExitPrice;
+    trade.currentLotAmount = trade.exitOptionLotAmount;
+  } else {
+    trade.result = result;
   }
 
   if (exitOrderResponse?.stopLossOrderFilled) {
-    const stopExitPrice = numeric(exitOrderResponse.exitPrice, optionExitPrice);
-    const stopExitAmount = numeric(exitOrderResponse.exitAmount, 0);
-    const pnl = getOptionOpenPnl(trade, stopExitPrice);
-    trade.result = pnl >= 0 ? "WIN" : "LOSS";
-    trade.exit_option_price = stopExitPrice || trade.exit_option_price;
-    trade.exitOptionLotAmount = stopExitAmount || trade.exitOptionLotAmount;
+    const stopExitPrice = numeric(exitOrderResponse.exitPrice, finalExitPrice);
+    const stopExitAmount = numeric(exitOrderResponse.exitAmount, Number((stopExitPrice * (realizedQuantity || 1)).toFixed(2)));
+    trade.exit_option_price = stopExitPrice;
+    trade.exitOptionLotAmount = stopExitAmount;
+    trade.currentOptionPrice = stopExitPrice;
+    trade.currentLotAmount = stopExitAmount;
+    if (realizedEntryPrice && realizedQuantity) {
+      const stopPnl = Number(((stopExitPrice - realizedEntryPrice) * realizedQuantity).toFixed(2));
+      trade.current_pnl = stopPnl;
+      trade.current_pnl_percent = getOptionPnlPercent(trade, stopPnl);
+      trade.result = stopPnl >= 0 ? "WIN" : "LOSS";
+    }
     trade.exit_reason = "BROKER_STOP_LOSS_FILLED";
   }
-  if (!exitOrderResponse?.stopLossOrderFilled) {
+  if (!trade.exitOptionLotAmount) {
     trade.exitOptionLotAmount = numeric(trade.exitOrderResponse?.exitAmount, 0) || undefined;
   }
+  if (!trade.currentLotAmount && trade.exitOptionLotAmount) {
+    trade.currentLotAmount = trade.exitOptionLotAmount;
+  }
+
   await trade.save();
 
-  const realizedLotPnl = Number.isFinite(trade.current_pnl) ? trade.current_pnl : getOptionOpenPnl(trade, numeric(trade.exit_option_price, optionExitPrice));
+  const realizedLotPnl = Number.isFinite(trade.current_pnl) ? trade.current_pnl : getOptionOpenPnl(trade, finalExitPrice);
   await sendSignal(buildExitTelegramMessage(trade, exitReason, realizedLotPnl));
 }
 
